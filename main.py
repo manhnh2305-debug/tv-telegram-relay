@@ -1,4 +1,4 @@
-import os, json, time, requests
+import os, json, time, uuid, requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone, timedelta
 
@@ -8,34 +8,45 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID   = os.environ.get("CHAT_ID", "")
 ICT       = timezone(timedelta(hours=7))
 
-ZONE_TTL  = 4 * 3600   # 4 tiếng
-RR        = 2.0         # Risk:Reward 1:2
-
-zone_state = {}   # { "XAUUSD": { active, expires, type, top, bottom } }
-pending    = {}   # { callback_id: signal_data }
-
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
+ZONE_TTL  = 4 * 3600
+zone_state = {}
+pending    = {}      # chờ xác nhận Telegram
+mt5_queue  = {}      # chờ EA poll
+risk_state = {}      # { chat_id: { callback_id, waiting_risk } }
 
 def now_ict():
     return datetime.now(ICT).strftime("%H:%M ICT %d/%m")
 
-def send_text(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+def send_text(text, reply_markup=None):
+    url     = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return requests.post(url, json=payload, timeout=10)
 
-def calc_sl_tp(action, price, zone_top, zone_bottom):
-    """Tính SL/TP với RR 1:2"""
+def edit_message(chat_id, msg_id, text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+    requests.post(url, json={
+        "chat_id": chat_id, "message_id": msg_id,
+        "text": text, "parse_mode": "HTML"
+    }, timeout=5)
+
+def answer_callback(cq_id, text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
+    requests.post(url, json={"callback_query_id": cq_id, "text": text}, timeout=5)
+
+def calc_sl_tp(action, price, zone_top, zone_bottom, rr=2.0):
     try:
         price = float(price)
         if action == "SELL" and zone_top > 0:
             sl   = zone_top
             risk = sl - price
-            tp   = round(price - risk * RR, 2)
+            tp   = round(price - risk * rr, 2)
             return round(sl, 2), tp
         elif action == "BUY" and zone_bottom > 0:
             sl   = zone_bottom
             risk = price - sl
-            tp   = round(price + risk * RR, 2)
+            tp   = round(price + risk * rr, 2)
             return round(sl, 2), tp
     except Exception:
         pass
@@ -48,60 +59,39 @@ def send_signal_message(data, callback_id):
     tf     = data.get("tf",     "M5")
     harsi  = data.get("harsi",  "—")
 
-    # Lấy zone info để tính SL/TP
-    zs         = zone_state.get(symbol, {})
-    zone_top   = zs.get("top",    0)
-    zone_bottom= zs.get("bottom", 0)
-    sl, tp     = calc_sl_tp(action, price, zone_top, zone_bottom)
+    zs          = zone_state.get(symbol, {})
+    zone_top    = zs.get("top",    0)
+    zone_bottom = zs.get("bottom", 0)
+    sl, tp      = calc_sl_tp(action, price, zone_top, zone_bottom)
+
+    data["sl"] = sl
+    data["tp"] = tp
 
     emoji    = "🔴" if action == "SELL" else "🟢"
     tf_emoji = "⚡" if tf == "M5" else "🔔"
-    header   = f"{tf_emoji} <b>SIGNAL {action} — {symbol} {tf}</b>" if tf == "M5" else \
-               f"{tf_emoji} <b>M15 CONFIRM {action} — {symbol}</b>"
-    footer   = "👉 Xác nhận vào lệnh:" if tf == "M5" else "💡 M15 đủ điều kiện — xem xét add thêm:"
     interval = "5" if tf == "M5" else "15"
     chart    = f"https://www.tradingview.com/chart/?symbol=OANDA%3AXAUUSD&interval={interval}"
+    header   = f"{tf_emoji} <b>SIGNAL {action} — {symbol} {tf}</b>"
 
     sl_line = f"🛑 SL: <b>{sl}</b>\n" if sl else ""
-    tp_line = f"🎯 TP: <b>{tp}</b>  (RR 1:{int(RR)})\n" if tp else ""
+    tp_line = f"🎯 TP: <b>{tp}</b>  (RR 1:2)\n" if tp else ""
 
     text = (
         f"{header}\n"
         f"━━━━━━━━━━━━━━━━━\n"
         f"📍 Giá: <b>{price}</b>\n"
         f"📊 HARSI: {harsi}\n"
-        f"{sl_line}"
-        f"{tp_line}"
+        f"{sl_line}{tp_line}"
         f"⏰ {now_ict()}\n"
         f"🔗 <a href='{chart}'>Mở chart {tf}</a>\n\n"
-        f"{footer}"
+        f"👉 Xác nhận vào lệnh:"
     )
-
-    # Lưu SL/TP vào pending
-    data["sl"] = sl
-    data["tp"] = tp
 
     keyboard = {"inline_keyboard": [[
         {"text": f"{emoji} {action}", "callback_data": f"confirm_{callback_id}_{action}"},
         {"text": "❌ Bỏ qua",         "callback_data": f"skip_{callback_id}"}
     ]]}
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={
-        "chat_id": CHAT_ID, "text": text,
-        "parse_mode": "HTML", "reply_markup": keyboard
-    }, timeout=10)
-
-def answer_callback(cq_id, text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
-    requests.post(url, json={"callback_query_id": cq_id, "text": text}, timeout=5)
-
-def edit_message(chat_id, msg_id, text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-    requests.post(url, json={
-        "chat_id": chat_id, "message_id": msg_id,
-        "text": text, "parse_mode": "HTML"
-    }, timeout=5)
+    send_text(text, keyboard)
 
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 
@@ -112,10 +102,6 @@ def health():
 
 @app.route("/alert", methods=["POST"])
 def alert():
-    """
-    Nhận rectangle alert từ TradingView.
-    Format: XAUUSD|{{close}}|RESISTANCE|4550|4530|H1|Ghi chú
-    """
     data = {}
     try:
         data = request.get_json(force=True, silent=True) or {}
@@ -147,9 +133,8 @@ def alert():
         "bottom":  zone_bottom,
     }
 
-    emoji = "🔴" if zone_type == "RESISTANCE" else "🟢"
+    emoji   = "🔴" if zone_type == "RESISTANCE" else "🟢"
     sl_info = f"\n📐 Box: {zone_bottom} — {zone_top}" if zone_top and zone_bottom else ""
-
     text = (
         f"{emoji} <b>{symbol}</b> — Giá vào vùng <b>{zone_type}</b>\n"
         f"━━━━━━━━━━━━━━━━━\n"
@@ -165,7 +150,6 @@ def alert():
 
 @app.route("/signal", methods=["POST"])
 def signal():
-    """Nhận tín hiệu từ Pine Script — chỉ forward nếu zone active."""
     data = {}
     try:
         data = request.get_json(force=True, silent=True) or {}
@@ -185,7 +169,7 @@ def signal():
     if not zs or not zs.get("active") or time.time() > zs.get("expires", 0):
         return jsonify({"status": "ignored", "reason": "zone_not_active"}), 200
 
-    callback_id      = str(int(time.time()))
+    callback_id          = str(int(time.time()))
     pending[callback_id] = data
     send_signal_message(data, callback_id)
     return jsonify({"status": "sent", "callback_id": callback_id}), 200
@@ -193,9 +177,62 @@ def signal():
 
 @app.route("/webhook_tg", methods=["POST"])
 def webhook_tg():
-    """Nhận callback từ Telegram khi bấm nút inline."""
     update = request.get_json(force=True, silent=True) or {}
-    cq     = update.get("callback_query")
+
+    # ── Xử lý text reply (nhập risk USD) ──────────────────────────
+    msg = update.get("message", {})
+    if msg:
+        chat_id  = str(msg.get("chat", {}).get("id", ""))
+        text_in  = msg.get("text", "").strip()
+        rs       = risk_state.get(chat_id)
+
+        if rs and rs.get("waiting_risk"):
+            try:
+                risk_usd = float(text_in)
+            except ValueError:
+                send_text("⚠️ Vui lòng nhập số tiền hợp lệ (ví dụ: 50)")
+                return jsonify({"ok": True}), 200
+
+            callback_id = rs["callback_id"]
+            sig         = pending.pop(callback_id, {})
+            action      = rs["action"]
+            symbol      = sig.get("symbol", "XAUUSD")
+            price       = sig.get("price",  "—")
+            sl          = sig.get("sl")
+            tp          = sig.get("tp")
+            tf          = sig.get("tf", "M5")
+            emoji       = "🔴" if action == "SELL" else "🟢"
+
+            # Tạo order đưa vào MT5 queue
+            order_id = str(uuid.uuid4())[:8]
+            mt5_queue[order_id] = {
+                "order_id": order_id,
+                "action":   action,
+                "symbol":   symbol + ".r",  # Exness raw spread
+                "price":    price,
+                "sl":       sl,
+                "tp":       tp,
+                "risk_usd": risk_usd,
+                "tf":       tf,
+                "created":  time.time()
+            }
+
+            # Xóa risk_state
+            del risk_state[chat_id]
+
+            send_text(
+                f"{emoji} <b>ĐÃ XÁC NHẬN {action}</b> — {symbol}\n"
+                f"📍 Entry: {price} | {tf}\n"
+                f"🛑 SL: {sl}\n"
+                f"🎯 TP: {tp}  (RR 1:2)\n"
+                f"💰 Risk: ${risk_usd}\n"
+                f"⏰ {now_ict()}\n"
+                f"⏳ <i>Đang chờ EA MT5 thực thi...</i>"
+            )
+            return jsonify({"ok": True}), 200
+
+    # ── Xử lý callback query (bấm nút inline) ─────────────────────
+    cq = update.get("callback_query")
     if not cq:
         return jsonify({"ok": True}), 200
 
@@ -203,30 +240,29 @@ def webhook_tg():
     cq_data = cq.get("data", "")
     message = cq.get("message", {})
     msg_id  = message.get("message_id")
-    chat_id = message.get("chat", {}).get("id")
+    chat_id = str(message.get("chat", {}).get("id", ""))
     parts   = cq_data.split("_")
 
     if parts[0] == "confirm" and len(parts) >= 3:
-        cb_id  = parts[1]
-        action = parts[2]
-        sig    = pending.pop(cb_id, {})
-        symbol = sig.get("symbol", "XAUUSD")
-        price  = sig.get("price",  "—")
-        tf     = sig.get("tf",     "M5")
-        sl     = sig.get("sl",     "—")
-        tp     = sig.get("tp",     "—")
-        emoji  = "🔴" if action == "SELL" else "🟢"
+        callback_id = parts[1]
+        action      = parts[2]
+        sig         = pending.get(callback_id, {})
+        emoji       = "🔴" if action == "SELL" else "🟢"
 
-        answer_callback(cq_id, f"✅ Đã xác nhận {action}!")
+        answer_callback(cq_id, f"✅ Nhập số tiền risk tối đa (USD)")
         edit_message(chat_id, msg_id,
-            f"{emoji} <b>ĐÃ XÁC NHẬN {action}</b> — {symbol} {tf}\n"
-            f"📍 Entry: {price}\n"
-            f"🛑 SL: {sl}\n"
-            f"🎯 TP: {tp}  (RR 1:{int(RR)})\n"
-            f"⏰ {now_ict()}\n"
-            f"⏳ <i>Đang gửi lệnh xuống MT5...</i>"
+            f"{emoji} <b>XÁC NHẬN {action}</b> — {sig.get('symbol','XAUUSD')}\n"
+            f"📍 Entry: {sig.get('price','—')} | SL: {sig.get('sl','—')} | TP: {sig.get('tp','—')}\n\n"
+            f"💰 <b>Reply tin nhắn này với số tiền risk tối đa (USD)</b>\n"
+            f"<i>Ví dụ: 50</i>"
         )
-        # TODO GĐ3: gửi lệnh xuống MT5 EA
+
+        # Lưu trạng thái chờ risk
+        risk_state[chat_id] = {
+            "callback_id":   callback_id,
+            "action":        action,
+            "waiting_risk":  True
+        }
 
     elif parts[0] == "skip" and len(parts) >= 2:
         cb_id = parts[1]
@@ -234,6 +270,42 @@ def webhook_tg():
         answer_callback(cq_id, "❌ Đã bỏ qua")
         edit_message(chat_id, msg_id,
             f"❌ <b>Đã bỏ qua</b> — {sig.get('symbol','XAUUSD')} {sig.get('tf','')}\n"
+            f"⏰ {now_ict()}"
+        )
+        risk_state.pop(chat_id, None)
+
+    return jsonify({"ok": True}), 200
+
+
+@app.route("/mt5/pending", methods=["GET"])
+def mt5_pending():
+    """EA poll endpoint — trả về lệnh đầu tiên trong queue."""
+    # Dọn lệnh cũ hơn 5 phút
+    now = time.time()
+    expired = [k for k, v in mt5_queue.items() if now - v.get("created", 0) > 300]
+    for k in expired:
+        del mt5_queue[k]
+
+    if not mt5_queue:
+        return jsonify({}), 200
+
+    order_id = next(iter(mt5_queue))
+    return jsonify(mt5_queue[order_id]), 200
+
+
+@app.route("/mt5/ack", methods=["POST"])
+def mt5_ack():
+    """EA báo đã xử lý lệnh → xóa khỏi queue."""
+    data     = request.get_json(force=True, silent=True) or {}
+    order_id = data.get("order_id", "")
+    status   = data.get("status", "")
+
+    if order_id in mt5_queue:
+        sig = mt5_queue.pop(order_id)
+        emoji = "✅" if status == "filled" else "❌"
+        send_text(
+            f"{emoji} <b>MT5: {status.upper()}</b>\n"
+            f"📍 {sig.get('action')} {sig.get('symbol')} @ {sig.get('price')}\n"
             f"⏰ {now_ict()}"
         )
 
