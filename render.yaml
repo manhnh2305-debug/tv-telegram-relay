@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: tv-telegram-relay
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app
+    envVars:
+      - key: BOT_TOKEN
+        sync: false   # điền tay trên Render dashboard
+      - key: CHAT_ID
+        sync: false   # điền tay trên Render dashboard
