@@ -29,6 +29,7 @@ MAX_PRICE_DEV   = float(os.environ.get("MAX_PRICE_DEV", "5")) # USD — bỏ sig
 DEFAULT_RR      = float(os.environ.get("DEFAULT_RR", "2.0"))
 ZONE_TTL        = int(os.environ.get("ZONE_TTL", "14400"))     # 4h
 ORDER_TTL       = int(os.environ.get("ORDER_TTL", "300"))      # 5 min
+SHEET_URL       = os.environ.get("SHEET_URL", "")              # Google Apps Script URL cho trade log
 STATE_FILE      = "/tmp/relay_state.json"
 ICT             = timezone(timedelta(hours=7))
 
@@ -144,6 +145,91 @@ def send_text(text, reply_markup=None):
     except Exception as e:
         log.error(f"Telegram send failed: {e}")
         return None
+
+
+def calc_pnl_usd(symbol, lots, entry, exit_price):
+    """Tính P&L theo USD — dùng Exness CFD contract specs."""
+    try:
+        entry = float(entry)
+        exit_price = float(exit_price)
+        lots = float(lots)
+        dist = abs(exit_price - entry)
+        sym = symbol.upper().replace(SYMBOL_SUFFIX, "")
+
+        # Gold: 1 lot = 100 oz
+        if "XAU" in sym:
+            return dist * 100 * lots
+        # Silver: 1 lot = 5000 oz
+        elif "XAG" in sym:
+            return dist * 5000 * lots
+        # BTC/ETH: 1 lot = 1 unit
+        elif "BTC" in sym or "ETH" in sym:
+            return dist * lots
+        # Indices: contract = 10
+        elif sym in ("NAS100", "US30", "US500"):
+            return dist * 10 * lots
+        # JPY pairs: pip = 0.01
+        elif "JPY" in sym:
+            return (dist / 0.01) * 10 * lots
+        # Standard forex: pip = 0.0001
+        else:
+            return (dist / 0.0001) * 10 * lots
+    except Exception:
+        return 0
+
+
+def sync_sheet(sig, lot_str=""):
+    """Gửi trade data lên Google Sheets qua Apps Script."""
+    if not SHEET_URL:
+        log.info("SHEET_URL not configured — skip trade log")
+        return
+
+    try:
+        symbol  = sig.get("symbol", "XAUUSD").replace(SYMBOL_SUFFIX, "")
+        action  = sig.get("action", "")
+        entry   = sig.get("price", 0)
+        sl      = sig.get("sl", 0)
+        tp      = sig.get("tp", 0)
+        risk    = sig.get("risk_usd", 0)
+        tf      = sig.get("tf", "M5")
+
+        # Parse lot từ detail string ("0.15 lot @ spread $0.25")
+        lot = 0.01
+        if lot_str:
+            parts = lot_str.split()
+            if parts:
+                try:
+                    lot = float(parts[0])
+                except ValueError:
+                    pass
+
+        # Tính P&L
+        sl_pnl = calc_pnl_usd(symbol, lot, entry, sl) if sl else 0
+        tp_pnl = calc_pnl_usd(symbol, lot, entry, tp) if tp else 0
+        rr = f"1:{tp_pnl/sl_pnl:.2f}" if sl_pnl > 0 else "-"
+
+        direction = "LONG" if action == "BUY" else "SHORT"
+
+        payload = {
+            "time":      now_ict(),
+            "pair":      symbol,
+            "direction": direction,
+            "lot":       lot,
+            "entry":     entry,
+            "sl":        sl,
+            "tp":        tp,
+            "maxLoss":   f"{sl_pnl:.2f}",
+            "maxProfit": f"{tp_pnl:.2f}",
+            "rr":        rr,
+            "emotion":   "confident",
+            "reason":    f"SemiAutoEA {tf} — VSA+HARSI signal"
+        }
+
+        requests.post(SHEET_URL, json=payload, timeout=10)
+        log.info(f"Trade logged to Sheet: {direction} {symbol} {lot} lot | SL ${sl_pnl:.2f} TP ${tp_pnl:.2f}")
+
+    except Exception as e:
+        log.error(f"Sheet sync failed: {e}")
 
 
 def edit_message(chat_id, msg_id, text):
@@ -530,6 +616,10 @@ def mt5_ack():
                 f"⏰ {now_ict()}"
             )
             log.info(f"Order ack: {order_id} — {status} {detail}")
+
+            # Auto-log vào Google Sheets khi lệnh filled
+            if status == "filled":
+                sync_sheet(sig, detail)
         else:
             log.warning(f"Ack for unknown order: {order_id}")
 
