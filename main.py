@@ -385,7 +385,7 @@ def alert():
 
 @app.route("/signal", methods=["POST"])
 def signal_route():
-    """TradingView signal → Telegram confirmation button."""
+    """TradingView signal → auto-activate zone → Telegram confirmation button."""
     if not verify_api_key():
         log.warning(f"Unauthorized /signal from {request.remote_addr}")
         return jsonify({"error": "unauthorized"}), 401
@@ -407,6 +407,26 @@ def signal_route():
 
     with lock:
         cleanup()
+
+        # Auto-activate zone nếu signal mang zone data (từ indicator v2)
+        sig_top = 0
+        sig_bot = 0
+        try:
+            sig_top = float(data.get("top", 0))
+            sig_bot = float(data.get("bottom", 0))
+        except Exception:
+            pass
+
+        if sig_top > 0 and sig_bot > 0:
+            zone_state[symbol] = {
+                "active":  True,
+                "expires": time.time() + ZONE_TTL,
+                "type":    data.get("zone_type", "ZONE").upper(),
+                "top":     sig_top,
+                "bottom":  sig_bot,
+            }
+            log.info(f"Zone auto-activated from signal: {symbol} [{sig_bot} - {sig_top}]")
+
         zs = zone_state.get(symbol)
 
         # Check zone active
@@ -421,10 +441,25 @@ def signal_route():
             return jsonify({"status": "ignored", "reason": "duplicate"}), 200
         seen_signals[sh] = time.time()
 
-        # Calc SL/TP from zone
+        # Calc SL/TP — divergence signal gui kem SL tu pivot
         action = data.get("action", "")
         price  = data.get("price", 0)
-        sl, tp = calc_sl_tp(action, price, zs.get("top", 0), zs.get("bottom", 0))
+        div_sl = data.get("div_sl")
+        signal_type = data.get("signal_type", "vsa")
+
+        if div_sl and signal_type == "div":
+            # Divergence: SL tu pivot point (da tinh san trong indicator)
+            try:
+                sl = round(float(div_sl), 2)
+                price_f = float(price)
+                risk = abs(price_f - sl)
+                tp = round(price_f + risk * DEFAULT_RR, 2) if action == "BUY" else round(price_f - risk * DEFAULT_RR, 2)
+            except Exception:
+                sl, tp = None, None
+        else:
+            # VSA: SL tu zone edge (logic cu)
+            sl, tp = calc_sl_tp(action, price, zs.get("top", 0), zs.get("bottom", 0))
+
         data["sl"] = sl
         data["tp"] = tp
 
