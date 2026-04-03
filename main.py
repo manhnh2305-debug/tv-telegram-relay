@@ -415,11 +415,24 @@ def signal_route():
     except Exception:
         pass
     if not data:
-        raw = request.data.decode("utf-8").strip()
+        raw = request.data.decode("utf-8", errors="replace").strip()
+        # Loại bỏ BOM và ký tự ẩn đầu string
+        raw = raw.lstrip("\ufeff\u200b\u00a0")
+        log.info(f"Raw body (first 500): {repr(raw[:500])}")
+        send_diag(
+            f"📦 Raw body nhận được:\n"
+            f"<code>{raw[:400]}</code>\n"
+            f"📏 Length: {len(raw)} bytes\n"
+            f"🔤 First 10 chars: <code>{repr(raw[:10])}</code>"
+        )
         try:
             data = json.loads(raw)
-        except Exception:
-            send_diag(f"❌ /signal body không parse được:\n<code>{raw[:200]}</code>")
+        except Exception as e:
+            send_diag(
+                f"❌ JSON parse FAILED:\n"
+                f"🐛 Error: <code>{str(e)[:200]}</code>\n"
+                f"📦 Body: <code>{raw[:400]}</code>"
+            )
             return jsonify({"error": "invalid body"}), 400
 
     symbol = data.get("symbol", "XAUUSD")
