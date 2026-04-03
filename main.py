@@ -409,31 +409,32 @@ def signal_route():
         send_diag(f"❌ Unauthorized /signal từ {request.remote_addr}")
         return jsonify({"error": "unauthorized"}), 401
 
+    # ── Parse body — luôn dùng raw trước, robust hơn get_json ──
+    raw = request.data.decode("utf-8", errors="replace").strip()
+    raw = raw.lstrip("\ufeff\u200b\u00a0")  # loại BOM, zero-width space
+
+    log.info(f"📨 /signal raw ({len(raw)} bytes): {repr(raw[:300])}")
+    send_diag(
+        f"📦 Raw body ({len(raw)} bytes):\n"
+        f"<code>{raw[:400]}</code>"
+    )
+
     data = {}
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-    except Exception:
-        pass
-    if not data:
-        raw = request.data.decode("utf-8", errors="replace").strip()
-        # Loại bỏ BOM và ký tự ẩn đầu string
-        raw = raw.lstrip("\ufeff\u200b\u00a0")
-        log.info(f"Raw body (first 500): {repr(raw[:500])}")
-        send_diag(
-            f"📦 Raw body nhận được:\n"
-            f"<code>{raw[:400]}</code>\n"
-            f"📏 Length: {len(raw)} bytes\n"
-            f"🔤 First 10 chars: <code>{repr(raw[:10])}</code>"
-        )
+    if raw:
         try:
             data = json.loads(raw)
         except Exception as e:
+            log.warning(f"JSON parse failed: {e}")
             send_diag(
                 f"❌ JSON parse FAILED:\n"
                 f"🐛 Error: <code>{str(e)[:200]}</code>\n"
                 f"📦 Body: <code>{raw[:400]}</code>"
             )
             return jsonify({"error": "invalid body"}), 400
+
+    if not data:
+        send_diag(f"❌ Body rỗng hoặc không có data\nContent-Type: <code>{request.content_type}</code>")
+        return jsonify({"error": "empty body"}), 400
 
     symbol = data.get("symbol", "XAUUSD")
     action = data.get("action", "")
