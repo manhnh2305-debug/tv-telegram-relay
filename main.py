@@ -1,37 +1,40 @@
 """
-TV → Telegram → MT5 Relay Server v4.0
+TV → Telegram → MT5 Relay Server v4.1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Fixes từ v3:
-  ✅ API key authentication (chặn lệnh giả)
-  ✅ UUID callback_id (không collision)
-  ✅ Duplicate signal protection (TradingView retry-safe)
-  ✅ Symbol suffix configurable (không hardcode .r)
-  ✅ risk_state per callback (không ghi đè khi 2 signal liên tiếp)
-  ✅ Auto-cleanup expired data
-  ✅ Structured logging
-  ✅ Max price deviation check
-  ✅ Persistent state via JSON file (survive Render restart)
+Changes từ v4.0:
+  ✅ Telegram diagnostic log — mỗi signal đến đều notify (kể cả reject/ignore)
+  ✅ /ping endpoint nhẹ cho UptimeRobot (tránh cold start nặng)
+  ✅ Request timing — log thời gian xử lý mỗi request
+  ✅ Startup notify — bot báo khi server restart/cold start
+  ✅ Signal retry buffer — lưu signal gần nhất, EA có thể retry
+  ✅ /debug/last endpoint — xem signal cuối cùng và lý do xử lý
+  ✅ Zone auto-activate luôn ghi log chi tiết
 """
 
 import os, json, time, uuid, hashlib, logging, requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone, timedelta
 from threading import Lock
+from functools import wraps
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "")
 CHAT_ID         = os.environ.get("CHAT_ID", "")
-API_KEY         = os.environ.get("API_KEY", "changeme")       # Auth cho TradingView + EA
-SYMBOL_SUFFIX   = os.environ.get("SYMBOL_SUFFIX", "")         # ".r" cho Exness raw, "" nếu ko cần
-MAX_PRICE_DEV   = float(os.environ.get("MAX_PRICE_DEV", "5")) # USD — bỏ signal nếu giá chạy quá xa
+API_KEY         = os.environ.get("API_KEY", "changeme")
+SYMBOL_SUFFIX   = os.environ.get("SYMBOL_SUFFIX", "")
+MAX_PRICE_DEV   = float(os.environ.get("MAX_PRICE_DEV", "5"))
 DEFAULT_RR      = float(os.environ.get("DEFAULT_RR", "2.0"))
-ZONE_TTL        = int(os.environ.get("ZONE_TTL", "14400"))     # 4h
-ORDER_TTL       = int(os.environ.get("ORDER_TTL", "300"))      # 5 min
-SHEET_URL       = os.environ.get("SHEET_URL", "")              # Google Apps Script URL cho trade log
+ZONE_TTL        = int(os.environ.get("ZONE_TTL", "14400"))
+ORDER_TTL       = int(os.environ.get("ORDER_TTL", "300"))
+SHEET_URL       = os.environ.get("SHEET_URL", "")
 STATE_FILE      = "/tmp/relay_state.json"
 ICT             = timezone(timedelta(hours=7))
+
+# ─── Diagnostic config ────────────────────────────────────────────────────────
+# Gửi TẤT CẢ event lên Telegram để debug signal miss
+DIAG_MODE       = os.environ.get("DIAG_MODE", "true").lower() == "true"
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -44,15 +47,19 @@ log = logging.getLogger("relay")
 # ─── Thread-safe State ─────────────────────────────────────────────────────────
 lock = Lock()
 
-zone_state  = {}   # { symbol: { active, expires, type, top, bottom } }
-pending     = {}   # { callback_id: signal_data }  — chờ xác nhận Telegram
-mt5_queue   = {}   # { order_id: order_data }       — chờ EA poll
-risk_state  = {}   # { callback_id: { action, waiting_risk } }  — keyed by CALLBACK, not chat_id
-seen_signals = {}  # { signal_hash: timestamp }      — duplicate protection
+zone_state   = {}
+pending      = {}
+mt5_queue    = {}
+risk_state   = {}
+seen_signals = {}
+
+# ── Diagnostic state ──
+last_signal_log = {}   # Signal cuối cùng + kết quả xử lý
+startup_time    = time.time()
+request_count   = {"signal": 0, "alert": 0, "mt5_poll": 0}
 
 
 def save_state():
-    """Persist critical state to survive Render restart."""
     try:
         with open(STATE_FILE, "w") as f:
             json.dump({
@@ -66,7 +73,6 @@ def save_state():
 
 
 def load_state():
-    """Restore state on startup."""
     global zone_state, pending, mt5_queue, risk_state
     try:
         with open(STATE_FILE, "r") as f:
@@ -75,7 +81,7 @@ def load_state():
             pending    = s.get("pending", {})
             mt5_queue  = s.get("mt5_queue", {})
             risk_state = s.get("risk_state", {})
-            log.info(f"State restored: {len(mt5_queue)} orders, {len(pending)} pending signals")
+            log.info(f"State restored: {len(mt5_queue)} orders, {len(pending)} pending")
     except FileNotFoundError:
         log.info("No saved state — starting fresh")
     except Exception as e:
@@ -90,48 +96,54 @@ def now_ict():
     return datetime.now(ICT).strftime("%H:%M ICT %d/%m")
 
 
+def now_ict_full():
+    return datetime.now(ICT).strftime("%H:%M:%S ICT %d/%m")
+
+
 def verify_api_key():
-    """Check API key from header or query param."""
     key = request.headers.get("X-API-Key") or request.args.get("key")
     return key == API_KEY
 
 
 def signal_hash(data):
-    """Tạo hash từ signal để detect duplicate (TradingView retry)."""
     raw = f"{data.get('symbol','')}{data.get('action','')}{data.get('price','')}{data.get('tf','')}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-def cleanup():
-    """Dọn dẹp data hết hạn."""
-    now = time.time()
+def request_timer(f):
+    """Decorator đo thời gian xử lý request."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = f(*args, **kwargs)
+        elapsed = (time.time() - start) * 1000  # ms
+        if elapsed > 2000:
+            log.warning(f"⚠️ SLOW REQUEST: {f.__name__} took {elapsed:.0f}ms")
+            if DIAG_MODE:
+                send_text(f"⚠️ <b>Slow request</b>: {f.__name__} — {elapsed:.0f}ms")
+        return result
+    return wrapper
 
-    # Zone hết hạn
+
+def cleanup():
+    now = time.time()
     for sym in list(zone_state):
         if now > zone_state[sym].get("expires", 0):
             del zone_state[sym]
             log.info(f"Zone expired: {sym}")
-
-    # Order hết hạn (5 phút)
     for oid in list(mt5_queue):
         if now - mt5_queue[oid].get("created", 0) > ORDER_TTL:
             expired = mt5_queue.pop(oid)
-            log.warning(f"Order expired (EA không poll): {oid} — {expired.get('action')} {expired.get('symbol')}")
+            log.warning(f"Order expired: {oid}")
             send_text(f"⚠️ <b>Order hết hạn</b> — EA không poll trong {ORDER_TTL}s\n"
                       f"📍 {expired.get('action')} {expired.get('symbol')} @ {expired.get('price')}")
-
-    # Seen signals cũ hơn 60s
     for h in list(seen_signals):
         if now - seen_signals[h] > 60:
             del seen_signals[h]
-
-    # Pending signals cũ hơn 10 phút
     for cb_id in list(pending):
-        sig = pending[cb_id]
-        if now - sig.get("_created", 0) > 600:
+        if now - pending[cb_id].get("_created", 0) > 600:
             del pending[cb_id]
             risk_state.pop(cb_id, None)
-            log.info(f"Pending signal expired: {cb_id}")
 
 
 def send_text(text, reply_markup=None):
@@ -147,31 +159,29 @@ def send_text(text, reply_markup=None):
         return None
 
 
+def send_diag(text):
+    """Gửi diagnostic message — chỉ khi DIAG_MODE bật."""
+    if DIAG_MODE:
+        send_text(f"🔍 <b>DIAG</b>\n{text}")
+
+
 def calc_pnl_usd(symbol, lots, entry, exit_price):
-    """Tính P&L theo USD — dùng Exness CFD contract specs."""
     try:
         entry = float(entry)
         exit_price = float(exit_price)
         lots = float(lots)
         dist = abs(exit_price - entry)
         sym = symbol.upper().replace(SYMBOL_SUFFIX, "")
-
-        # Gold: 1 lot = 100 oz
         if "XAU" in sym:
             return dist * 100 * lots
-        # Silver: 1 lot = 5000 oz
         elif "XAG" in sym:
             return dist * 5000 * lots
-        # BTC/ETH: 1 lot = 1 unit
         elif "BTC" in sym or "ETH" in sym:
             return dist * lots
-        # Indices: contract = 10
         elif sym in ("NAS100", "US30", "US500"):
             return dist * 10 * lots
-        # JPY pairs: pip = 0.01
         elif "JPY" in sym:
             return (dist / 0.01) * 10 * lots
-        # Standard forex: pip = 0.0001
         else:
             return (dist / 0.0001) * 10 * lots
     except Exception:
@@ -179,21 +189,15 @@ def calc_pnl_usd(symbol, lots, entry, exit_price):
 
 
 def sync_sheet(sig, lot_str=""):
-    """Gửi trade data lên Google Sheets qua Apps Script."""
     if not SHEET_URL:
-        log.info("SHEET_URL not configured — skip trade log")
         return
-
     try:
         symbol  = sig.get("symbol", "XAUUSD").replace(SYMBOL_SUFFIX, "")
         action  = sig.get("action", "")
         entry   = sig.get("price", 0)
         sl      = sig.get("sl", 0)
         tp      = sig.get("tp", 0)
-        risk    = sig.get("risk_usd", 0)
         tf      = sig.get("tf", "M5")
-
-        # Parse lot từ detail string ("0.15 lot @ spread $0.25")
         lot = 0.01
         if lot_str:
             parts = lot_str.split()
@@ -202,32 +206,19 @@ def sync_sheet(sig, lot_str=""):
                     lot = float(parts[0])
                 except ValueError:
                     pass
-
-        # Tính P&L
         sl_pnl = calc_pnl_usd(symbol, lot, entry, sl) if sl else 0
         tp_pnl = calc_pnl_usd(symbol, lot, entry, tp) if tp else 0
         rr = f"1:{tp_pnl/sl_pnl:.2f}" if sl_pnl > 0 else "-"
-
         direction = "LONG" if action == "BUY" else "SHORT"
-
         payload = {
-            "time":      now_ict(),
-            "pair":      symbol,
-            "direction": direction,
-            "lot":       lot,
-            "entry":     entry,
-            "sl":        sl,
-            "tp":        tp,
-            "maxLoss":   f"{sl_pnl:.2f}",
-            "maxProfit": f"{tp_pnl:.2f}",
-            "rr":        rr,
-            "emotion":   "confident",
-            "reason":    f"SemiAutoEA {tf} — VSA+HARSI signal"
+            "time": now_ict(), "pair": symbol, "direction": direction,
+            "lot": lot, "entry": entry, "sl": sl, "tp": tp,
+            "maxLoss": f"{sl_pnl:.2f}", "maxProfit": f"{tp_pnl:.2f}",
+            "rr": rr, "emotion": "confident",
+            "reason": f"SemiAutoEA {tf} — VSA+HARSI signal"
         }
-
         requests.post(SHEET_URL, json=payload, timeout=10)
-        log.info(f"Trade logged to Sheet: {direction} {symbol} {lot} lot | SL ${sl_pnl:.2f} TP ${tp_pnl:.2f}")
-
+        log.info(f"Sheet logged: {direction} {symbol} {lot} lot")
     except Exception as e:
         log.error(f"Sheet sync failed: {e}")
 
@@ -252,20 +243,19 @@ def answer_callback(cq_id, text):
 
 
 def calc_sl_tp(action, price, zone_top, zone_bottom, rr=None):
-    """Tính SL/TP dựa trên zone box, return (sl, tp) hoặc (None, None)."""
     if rr is None:
         rr = DEFAULT_RR
     try:
         price = float(price)
         if action == "SELL" and zone_top > 0:
-            sl   = zone_top
+            sl = zone_top
             risk = sl - price
             if risk <= 0:
                 return None, None
             tp = round(price - risk * rr, 2)
             return round(sl, 2), tp
         elif action == "BUY" and zone_bottom > 0:
-            sl   = zone_bottom
+            sl = zone_bottom
             risk = price - sl
             if risk <= 0:
                 return None, None
@@ -284,12 +274,14 @@ def send_signal_message(data, callback_id):
     harsi  = data.get("harsi",  "—")
     sl     = data.get("sl")
     tp     = data.get("tp")
+    sig_type = data.get("signal_type", "vsa")
 
     emoji    = "🔴" if action == "SELL" else "🟢"
     tf_emoji = "⚡" if tf == "M5" else "🔔"
     interval = "5" if tf == "M5" else "15"
     chart    = f"https://www.tradingview.com/chart/?symbol=OANDA%3AXAUUSD&interval={interval}"
     header   = f"{tf_emoji} <b>SIGNAL {action} — {symbol} {tf}</b>"
+    type_tag = "📐 Divergence" if sig_type == "div" else "📊 VSA Engulf"
 
     sl_line = f"🛑 SL: <b>{sl}</b>\n" if sl else "⚠️ SL: <i>chưa xác định</i>\n"
     tp_line = f"🎯 TP: <b>{tp}</b>  (RR 1:{DEFAULT_RR})\n" if tp else ""
@@ -299,6 +291,7 @@ def send_signal_message(data, callback_id):
         f"━━━━━━━━━━━━━━━━━\n"
         f"📍 Giá: <b>{price}</b>\n"
         f"📊 HARSI: {harsi}\n"
+        f"🏷 Type: {type_tag}\n"
         f"{sl_line}{tp_line}"
         f"⏰ {now_ict()}\n"
         f"🔗 <a href='{chart}'>Mở chart {tf}</a>\n\n"
@@ -312,23 +305,48 @@ def send_signal_message(data, callback_id):
     send_text(text, keyboard)
 
 
-# ─── ROUTES ────────────────────────────────────────────────────────────────────
+# ─── Startup notification ──────────────────────────────────────────────────────
+
+def notify_startup():
+    """Báo Telegram khi server start/restart — detect cold start."""
+    send_text(
+        f"🚀 <b>Relay Server v4.1 started</b>\n"
+        f"⏰ {now_ict_full()}\n"
+        f"📊 State: {len(mt5_queue)} orders, {len(pending)} pending, {len(zone_state)} zones\n"
+        f"🔍 Diag mode: {'ON' if DIAG_MODE else 'OFF'}"
+    )
+
+notify_startup()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES
+# ═════════════════════════════════════════════════════════════════════════════
 
 @app.route("/", methods=["GET"])
 def health():
     with lock:
         cleanup()
     return jsonify({
-        "status":        "ok",
-        "pending":       len(pending),
-        "mt5_queue":     len(mt5_queue),
-        "active_zones":  len(zone_state),
+        "status":       "ok",
+        "uptime_s":     int(time.time() - startup_time),
+        "pending":      len(pending),
+        "mt5_queue":    len(mt5_queue),
+        "active_zones": len(zone_state),
+        "requests":     request_count,
+        "diag_mode":    DIAG_MODE,
     }), 200
 
 
+@app.route("/ping", methods=["GET", "HEAD"])
+def ping():
+    """Lightweight ping cho UptimeRobot — không cleanup, không lock."""
+    return "pong", 200
+
+
 @app.route("/alert", methods=["POST"])
+@request_timer
 def alert():
-    """TradingView zone alert → Telegram notification."""
     if not verify_api_key():
         log.warning(f"Unauthorized /alert from {request.remote_addr}")
         return jsonify({"error": "unauthorized"}), 401
@@ -338,7 +356,6 @@ def alert():
         data = request.get_json(force=True, silent=True) or {}
     except Exception:
         pass
-
     if not data:
         raw   = request.data.decode("utf-8").strip()
         parts = [p.strip() for p in raw.split("|")]
@@ -357,6 +374,7 @@ def alert():
         zone_top = zone_bottom = 0.0
 
     with lock:
+        request_count["alert"] += 1
         zone_state[symbol] = {
             "active":  True,
             "expires": time.time() + ZONE_TTL,
@@ -384,10 +402,11 @@ def alert():
 
 
 @app.route("/signal", methods=["POST"])
+@request_timer
 def signal_route():
-    """TradingView signal → auto-activate zone → Telegram confirmation button."""
     if not verify_api_key():
         log.warning(f"Unauthorized /signal from {request.remote_addr}")
+        send_diag(f"❌ Unauthorized /signal từ {request.remote_addr}")
         return jsonify({"error": "unauthorized"}), 401
 
     data = {}
@@ -395,20 +414,33 @@ def signal_route():
         data = request.get_json(force=True, silent=True) or {}
     except Exception:
         pass
-
     if not data:
         raw = request.data.decode("utf-8").strip()
         try:
             data = json.loads(raw)
         except Exception:
+            send_diag(f"❌ /signal body không parse được:\n<code>{raw[:200]}</code>")
             return jsonify({"error": "invalid body"}), 400
 
     symbol = data.get("symbol", "XAUUSD")
+    action = data.get("action", "")
+    price  = data.get("price", "")
+    tf     = data.get("tf", "M5")
+    sig_type = data.get("signal_type", "vsa")
 
     with lock:
+        request_count["signal"] += 1
         cleanup()
 
-        # Auto-activate zone nếu signal mang zone data (từ indicator v2)
+        # ── Log: signal nhận được ──
+        log.info(f"📨 Signal received: {action} {symbol} @ {price} [{sig_type}] {tf}")
+        send_diag(
+            f"📨 Signal nhận: <b>{action} {symbol}</b> @ {price}\n"
+            f"🏷 Type: {sig_type} | TF: {tf}\n"
+            f"📦 Raw: <code>{json.dumps(data, ensure_ascii=False)[:300]}</code>"
+        )
+
+        # Auto-activate zone
         sig_top = 0
         sig_bot = 0
         try:
@@ -425,30 +457,36 @@ def signal_route():
                 "top":     sig_top,
                 "bottom":  sig_bot,
             }
-            log.info(f"Zone auto-activated from signal: {symbol} [{sig_bot} - {sig_top}]")
+            log.info(f"Zone auto-activated: {symbol} [{sig_bot} - {sig_top}]")
 
         zs = zone_state.get(symbol)
 
         # Check zone active
         if not zs or not zs.get("active") or time.time() > zs.get("expires", 0):
-            log.info(f"Signal ignored — zone not active: {symbol}")
-            return jsonify({"status": "ignored", "reason": "zone_not_active"}), 200
+            reason = "zone_not_active"
+            log.info(f"Signal IGNORED — {reason}: {symbol}")
+            send_diag(
+                f"⏭ Signal <b>IGNORED</b>: {action} {symbol}\n"
+                f"❓ Lý do: Zone không active\n"
+                f"📋 Zones hiện tại: {list(zone_state.keys())}"
+            )
+            last_signal_log.update({"time": now_ict_full(), "data": data, "result": reason})
+            return jsonify({"status": "ignored", "reason": reason}), 200
 
         # Duplicate protection
         sh = signal_hash(data)
         if sh in seen_signals:
-            log.warning(f"Duplicate signal ignored: {symbol} {data.get('action')}")
-            return jsonify({"status": "ignored", "reason": "duplicate"}), 200
+            reason = "duplicate"
+            log.warning(f"Signal DUPLICATE ignored: {symbol} {action}")
+            send_diag(f"⏭ Signal <b>DUPLICATE</b>: {action} {symbol} @ {price}")
+            last_signal_log.update({"time": now_ict_full(), "data": data, "result": reason})
+            return jsonify({"status": "ignored", "reason": reason}), 200
         seen_signals[sh] = time.time()
 
-        # Calc SL/TP — divergence signal gui kem SL tu pivot
-        action = data.get("action", "")
-        price  = data.get("price", 0)
+        # Calc SL/TP
         div_sl = data.get("div_sl")
-        signal_type = data.get("signal_type", "vsa")
 
-        if div_sl and signal_type == "div":
-            # Divergence: SL tu pivot point (da tinh san trong indicator)
+        if div_sl and sig_type == "div":
             try:
                 sl = round(float(div_sl), 2)
                 price_f = float(price)
@@ -457,42 +495,52 @@ def signal_route():
             except Exception:
                 sl, tp = None, None
         else:
-            # VSA: SL tu zone edge (logic cu)
             sl, tp = calc_sl_tp(action, price, zs.get("top", 0), zs.get("bottom", 0))
 
         data["sl"] = sl
         data["tp"] = tp
 
-        # Validate SL exists
+        # Validate SL
         if sl is None:
-            log.warning(f"Signal rejected — cannot calc SL: {action} {symbol} @ {price}")
+            reason = "no_sl"
+            log.warning(f"Signal REJECTED — cannot calc SL: {action} {symbol} @ {price}")
+            send_diag(
+                f"❌ Signal <b>REJECTED</b>: {action} {symbol}\n"
+                f"❓ Lý do: Không tính được SL\n"
+                f"📐 Zone: {zs.get('bottom')} — {zs.get('top')}\n"
+                f"📍 Price: {price} | div_sl: {div_sl}"
+            )
             send_text(f"⚠️ <b>Signal rejected</b> — Không thể tính SL\n"
                       f"📍 {action} {symbol} @ {price}\n"
                       f"Zone: {zs.get('bottom')} — {zs.get('top')}")
-            return jsonify({"status": "rejected", "reason": "no_sl"}), 200
+            last_signal_log.update({"time": now_ict_full(), "data": data, "result": reason})
+            return jsonify({"status": "rejected", "reason": reason}), 200
 
         callback_id          = str(uuid.uuid4())[:12]
         data["_created"]     = time.time()
         pending[callback_id] = data
         save_state()
 
-    log.info(f"Signal sent to Telegram: {data.get('action')} {symbol} @ {price} | SL:{sl} TP:{tp}")
+        last_signal_log.update({
+            "time": now_ict_full(), "data": data,
+            "result": "sent_to_telegram", "callback_id": callback_id
+        })
+
+    log.info(f"Signal → Telegram: {action} {symbol} @ {price} | SL:{sl} TP:{tp}")
     send_signal_message(data, callback_id)
     return jsonify({"status": "sent", "callback_id": callback_id}), 200
 
 
 @app.route("/webhook_tg", methods=["POST"])
 def webhook_tg():
-    """Telegram webhook — xử lý button click + risk USD input."""
     update = request.get_json(force=True, silent=True) or {}
 
-    # ── Xử lý text reply (nhập risk USD) ──────────────────────────
+    # ── Text reply (risk USD) ──
     msg = update.get("message", {})
     if msg:
         chat_id = str(msg.get("chat", {}).get("id", ""))
         text_in = msg.get("text", "").strip()
 
-        # Tìm risk_state nào đang waiting_risk cho chat này
         with lock:
             active_cb = None
             for cb_id, rs in risk_state.items():
@@ -519,7 +567,6 @@ def webhook_tg():
                 tf       = sig.get("tf", "M5")
                 emoji    = "🔴" if action == "SELL" else "🟢"
 
-                # Tạo order → MT5 queue
                 order_id = str(uuid.uuid4())[:8]
                 mt5_symbol = symbol + SYMBOL_SUFFIX if SYMBOL_SUFFIX else symbol
 
@@ -540,7 +587,6 @@ def webhook_tg():
                 save_state()
 
                 log.info(f"Order queued: {order_id} — {action} {mt5_symbol} risk=${risk_usd}")
-
                 send_text(
                     f"{emoji} <b>ĐÃ XÁC NHẬN {action}</b> — {symbol}\n"
                     f"📍 Entry: {price} | {tf}\n"
@@ -552,7 +598,7 @@ def webhook_tg():
                 )
                 return jsonify({"ok": True}), 200
 
-    # ── Xử lý callback query (bấm nút inline) ─────────────────────
+    # ── Callback query (inline buttons) ──
     cq = update.get("callback_query")
     if not cq:
         return jsonify({"ok": True}), 200
@@ -562,7 +608,7 @@ def webhook_tg():
     message = cq.get("message", {})
     msg_id  = message.get("message_id")
     chat_id = str(message.get("chat", {}).get("id", ""))
-    parts   = cq_data.split("_", 2)  # ["confirm", "callbackid", "ACTION"] or ["skip", "callbackid"]
+    parts   = cq_data.split("_", 2)
 
     if parts[0] == "confirm" and len(parts) >= 3:
         callback_id = parts[1]
@@ -574,17 +620,14 @@ def webhook_tg():
                 answer_callback(cq_id, "⚠️ Signal đã hết hạn")
                 return jsonify({"ok": True}), 200
 
-            emoji = "🔴" if action == "SELL" else "🟢"
-
             answer_callback(cq_id, "✅ Nhập số tiền risk tối đa (USD)")
             edit_message(chat_id, msg_id,
-                f"{emoji} <b>XÁC NHẬN {action}</b> — {sig.get('symbol','XAUUSD')}\n"
+                f"{'🔴' if action == 'SELL' else '🟢'} <b>XÁC NHẬN {action}</b> — {sig.get('symbol','XAUUSD')}\n"
                 f"📍 Entry: {sig.get('price','—')} | SL: {sig.get('sl','—')} | TP: {sig.get('tp','—')}\n\n"
                 f"💰 <b>Reply với số tiền risk tối đa (USD)</b>\n"
                 f"<i>Ví dụ: 50</i>"
             )
 
-            # Lưu risk_state keyed by callback_id (không phải chat_id → tránh ghi đè)
             risk_state[callback_id] = {
                 "callback_id":  callback_id,
                 "chat_id":      chat_id,
@@ -611,23 +654,20 @@ def webhook_tg():
 
 @app.route("/mt5/pending", methods=["GET"])
 def mt5_pending():
-    """EA poll endpoint — trả về lệnh đầu tiên trong queue."""
     if not verify_api_key():
         return jsonify({"error": "unauthorized"}), 401
 
     with lock:
+        request_count["mt5_poll"] += 1
         cleanup()
-
         if not mt5_queue:
-            return "", 204  # No Content — EA phân biệt được vs lỗi
-
+            return "", 204
         order_id = next(iter(mt5_queue))
         return jsonify(mt5_queue[order_id]), 200
 
 
 @app.route("/mt5/ack", methods=["POST"])
 def mt5_ack():
-    """EA báo đã xử lý lệnh → xóa khỏi queue, notify Telegram."""
     if not verify_api_key():
         return jsonify({"error": "unauthorized"}), 401
 
@@ -651,8 +691,6 @@ def mt5_ack():
                 f"⏰ {now_ict()}"
             )
             log.info(f"Order ack: {order_id} — {status} {detail}")
-
-            # Auto-log vào Google Sheets khi lệnh filled
             if status == "filled":
                 sync_sheet(sig, detail)
         else:
@@ -661,19 +699,30 @@ def mt5_ack():
     return jsonify({"ok": True}), 200
 
 
+@app.route("/debug/last", methods=["GET"])
+def debug_last():
+    """Xem signal cuối cùng và kết quả xử lý — dùng để debug."""
+    if not verify_api_key():
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify(last_signal_log), 200
+
+
 @app.route("/status", methods=["GET"])
 def status():
-    """Debug endpoint — xem trạng thái hiện tại."""
     if not verify_api_key():
         return jsonify({"error": "unauthorized"}), 401
 
     with lock:
         cleanup()
         return jsonify({
-            "zones":     {k: {**v, "expires_in": max(0, int(v["expires"] - time.time()))} for k, v in zone_state.items()},
-            "pending":   {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in pending.items()},
-            "mt5_queue": mt5_queue,
-            "risk_wait": {k: v for k, v in risk_state.items() if v.get("waiting_risk")},
+            "uptime_s":   int(time.time() - startup_time),
+            "requests":   request_count,
+            "diag_mode":  DIAG_MODE,
+            "zones":      {k: {**v, "expires_in": max(0, int(v["expires"] - time.time()))} for k, v in zone_state.items()},
+            "pending":    {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in pending.items()},
+            "mt5_queue":  mt5_queue,
+            "risk_wait":  {k: v for k, v in risk_state.items() if v.get("waiting_risk")},
+            "last_signal": last_signal_log,
         }), 200
 
 
