@@ -1,13 +1,16 @@
 """
-TV → Telegram → MT5 Relay Server v4.1
+TV → Telegram → MT5 Relay Server v4.2
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Changes từ v4.0:
-  ✅ Telegram diagnostic log — mỗi signal đến đều notify (kể cả reject/ignore)
-  ✅ /ping endpoint nhẹ cho UptimeRobot (tránh cold start nặng)
-  ✅ Request timing — log thời gian xử lý mỗi request
-  ✅ Startup notify — bot báo khi server restart/cold start
-  ✅ Signal retry buffer — lưu signal gần nhất, EA có thể retry
-  ✅ /debug/last endpoint — xem signal cuối cùng và lý do xử lý
+Changes từ v4.1:
+  ✅ v4.2: Auto post signal sang kênh PUBLIC khi MT5 FILLED
+  ✅ v4.2: Format message đẹp cho kênh public (hashtag, RR, lot info)
+  ─── v4.1 features giữ nguyên ───
+  ✅ Telegram diagnostic log
+  ✅ /ping endpoint nhẹ cho UptimeRobot
+  ✅ Request timing
+  ✅ Startup notify
+  ✅ Signal retry buffer
+  ✅ /debug/last endpoint
   ✅ Zone auto-activate luôn ghi log chi tiết
 """
 
@@ -22,6 +25,7 @@ app = Flask(__name__)
 
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "")
 CHAT_ID         = os.environ.get("CHAT_ID", "")
+PUBLIC_CHAT_ID  = os.environ.get("PUBLIC_CHAT_ID", "@goldsignalnodelete")  # v4.2
 API_KEY         = os.environ.get("API_KEY", "changeme")
 SYMBOL_SUFFIX   = os.environ.get("SYMBOL_SUFFIX", "")
 MAX_PRICE_DEV   = float(os.environ.get("MAX_PRICE_DEV", "5"))
@@ -33,7 +37,6 @@ STATE_FILE      = "/tmp/relay_state.json"
 ICT             = timezone(timedelta(hours=7))
 
 # ─── Diagnostic config ────────────────────────────────────────────────────────
-# Gửi TẤT CẢ event lên Telegram để debug signal miss
 DIAG_MODE       = os.environ.get("DIAG_MODE", "true").lower() == "true"
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
@@ -54,7 +57,7 @@ risk_state   = {}
 seen_signals = {}
 
 # ── Diagnostic state ──
-last_signal_log = {}   # Signal cuối cùng + kết quả xử lý
+last_signal_log = {}
 startup_time    = time.time()
 request_count   = {"signal": 0, "alert": 0, "mt5_poll": 0}
 
@@ -111,12 +114,11 @@ def signal_hash(data):
 
 
 def request_timer(f):
-    """Decorator đo thời gian xử lý request."""
     @wraps(f)
     def wrapper(*args, **kwargs):
         start = time.time()
         result = f(*args, **kwargs)
-        elapsed = (time.time() - start) * 1000  # ms
+        elapsed = (time.time() - start) * 1000
         if elapsed > 2000:
             log.warning(f"⚠️ SLOW REQUEST: {f.__name__} took {elapsed:.0f}ms")
             if DIAG_MODE:
@@ -160,10 +162,79 @@ def send_text(text, reply_markup=None):
 
 
 def send_diag(text):
-    """Gửi diagnostic message — chỉ khi DIAG_MODE bật."""
     if DIAG_MODE:
         send_text(f"🔍 <b>DIAG</b>\n{text}")
 
+
+# ─── v4.2: Public Channel Post ────────────────────────────────────────────────
+
+def send_public_signal(sig, fill_detail=""):
+    """
+    Post signal sang kênh public khi MT5 FILLED.
+    Dùng chung BOT_TOKEN — bot đã là admin của cả 2 kênh.
+    """
+    if not PUBLIC_CHAT_ID:
+        log.warning("PUBLIC_CHAT_ID not set — skipping public post")
+        return
+
+    action  = sig.get("action", "")
+    symbol  = sig.get("symbol", "XAUUSD").replace(SYMBOL_SUFFIX, "")
+    price   = sig.get("price", "—")
+    sl      = sig.get("sl", "—")
+    tp      = sig.get("tp", "—")
+    tf      = sig.get("tf", "M5")
+
+    # Tính RR
+    rr_text = f"1:{DEFAULT_RR}"
+    try:
+        p = float(price)
+        s = float(sl)
+        t = float(tp)
+        risk_dist = abs(p - s)
+        reward_dist = abs(t - p)
+        if risk_dist > 0:
+            rr_text = f"1:{reward_dist / risk_dist:.1f}"
+    except (ValueError, TypeError, ZeroDivisionError):
+        pass
+
+    emoji = "🟢" if action == "BUY" else "🔴"
+    direction = action.upper()
+
+    # Lot info từ fill_detail (format: "0.02 lot @ spread $5.70")
+    lot_line = f"\n📦 {fill_detail}" if fill_detail else ""
+
+    text = (
+        f"{emoji} <b>{direction} {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"📍 Entry: <b>{price}</b>\n"
+        f"🛑 SL: <b>{sl}</b>\n"
+        f"🎯 TP: <b>{tp}</b>  |  RR {rr_text}\n"
+        f"⏰ {now_ict()}  |  {tf}"
+        f"{lot_line}\n\n"
+        f"#signal #{symbol} #{direction.lower()}"
+    )
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id":    PUBLIC_CHAT_ID,
+        "text":       text,
+        "parse_mode": "HTML",
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.ok:
+            log.info(f"✅ Public signal posted: {direction} {symbol} @ {price}")
+            # Notify kênh private rằng đã post public
+            send_text(f"📢 Đã post signal <b>{direction} {symbol}</b> sang kênh public")
+        else:
+            log.error(f"❌ Public post failed: {r.status_code} {r.text[:200]}")
+            send_text(f"❌ <b>Public post FAILED</b>: {r.status_code}\n<code>{r.text[:200]}</code>")
+    except Exception as e:
+        log.error(f"❌ Public post exception: {e}")
+        send_text(f"❌ <b>Public post ERROR</b>: {e}")
+
+
+# ─── More Helpers ──────────────────────────────────────────────────────────────
 
 def calc_pnl_usd(symbol, lots, entry, exit_price):
     try:
@@ -308,12 +379,12 @@ def send_signal_message(data, callback_id):
 # ─── Startup notification ──────────────────────────────────────────────────────
 
 def notify_startup():
-    """Báo Telegram khi server start/restart — detect cold start."""
     send_text(
-        f"🚀 <b>Relay Server v4.1 started</b>\n"
+        f"🚀 <b>Relay Server v4.2 started</b>\n"
         f"⏰ {now_ict_full()}\n"
         f"📊 State: {len(mt5_queue)} orders, {len(pending)} pending, {len(zone_state)} zones\n"
-        f"🔍 Diag mode: {'ON' if DIAG_MODE else 'OFF'}"
+        f"🔍 Diag mode: {'ON' if DIAG_MODE else 'OFF'}\n"
+        f"📢 Public channel: {PUBLIC_CHAT_ID or 'NOT SET'}"
     )
 
 notify_startup()
@@ -328,19 +399,20 @@ def health():
     with lock:
         cleanup()
     return jsonify({
-        "status":       "ok",
-        "uptime_s":     int(time.time() - startup_time),
-        "pending":      len(pending),
-        "mt5_queue":    len(mt5_queue),
-        "active_zones": len(zone_state),
-        "requests":     request_count,
-        "diag_mode":    DIAG_MODE,
+        "status":         "ok",
+        "version":        "4.2",
+        "uptime_s":       int(time.time() - startup_time),
+        "pending":        len(pending),
+        "mt5_queue":      len(mt5_queue),
+        "active_zones":   len(zone_state),
+        "requests":       request_count,
+        "diag_mode":      DIAG_MODE,
+        "public_channel": PUBLIC_CHAT_ID,
     }), 200
 
 
 @app.route("/ping", methods=["GET", "HEAD"])
 def ping():
-    """Lightweight ping cho UptimeRobot — không cleanup, không lock."""
     return "pong", 200
 
 
@@ -409,9 +481,8 @@ def signal_route():
         send_diag(f"❌ Unauthorized /signal từ {request.remote_addr}")
         return jsonify({"error": "unauthorized"}), 401
 
-    # ── Parse body — luôn dùng raw trước, robust hơn get_json ──
     raw = request.data.decode("utf-8", errors="replace").strip()
-    raw = raw.lstrip("\ufeff\u200b\u00a0")  # loại BOM, zero-width space
+    raw = raw.lstrip("\ufeff\u200b\u00a0")
 
     log.info(f"📨 /signal raw ({len(raw)} bytes): {repr(raw[:300])}")
     send_diag(
@@ -446,7 +517,6 @@ def signal_route():
         request_count["signal"] += 1
         cleanup()
 
-        # ── Log: signal nhận được ──
         log.info(f"📨 Signal received: {action} {symbol} @ {price} [{sig_type}] {tf}")
         send_diag(
             f"📨 Signal nhận: <b>{action} {symbol}</b> @ {price}\n"
@@ -454,7 +524,6 @@ def signal_route():
             f"📦 Raw: <code>{json.dumps(data, ensure_ascii=False)[:300]}</code>"
         )
 
-        # Auto-activate zone
         sig_top = 0
         sig_bot = 0
         try:
@@ -475,7 +544,6 @@ def signal_route():
 
         zs = zone_state.get(symbol)
 
-        # Check zone active
         if not zs or not zs.get("active") or time.time() > zs.get("expires", 0):
             reason = "zone_not_active"
             log.info(f"Signal IGNORED — {reason}: {symbol}")
@@ -487,7 +555,6 @@ def signal_route():
             last_signal_log.update({"time": now_ict_full(), "data": data, "result": reason})
             return jsonify({"status": "ignored", "reason": reason}), 200
 
-        # Duplicate protection
         sh = signal_hash(data)
         if sh in seen_signals:
             reason = "duplicate"
@@ -497,7 +564,6 @@ def signal_route():
             return jsonify({"status": "ignored", "reason": reason}), 200
         seen_signals[sh] = time.time()
 
-        # Calc SL/TP
         div_sl = data.get("div_sl")
 
         if div_sl and sig_type == "div":
@@ -514,7 +580,6 @@ def signal_route():
         data["sl"] = sl
         data["tp"] = tp
 
-        # Validate SL
         if sl is None:
             reason = "no_sl"
             log.warning(f"Signal REJECTED — cannot calc SL: {action} {symbol} @ {price}")
@@ -705,8 +770,11 @@ def mt5_ack():
                 f"⏰ {now_ict()}"
             )
             log.info(f"Order ack: {order_id} — {status} {detail}")
+
             if status == "filled":
                 sync_sheet(sig, detail)
+                # ── v4.2: Post sang kênh public ──
+                send_public_signal(sig, detail)
         else:
             log.warning(f"Ack for unknown order: {order_id}")
 
@@ -715,7 +783,6 @@ def mt5_ack():
 
 @app.route("/debug/last", methods=["GET"])
 def debug_last():
-    """Xem signal cuối cùng và kết quả xử lý — dùng để debug."""
     if not verify_api_key():
         return jsonify({"error": "unauthorized"}), 401
     return jsonify(last_signal_log), 200
@@ -729,14 +796,16 @@ def status():
     with lock:
         cleanup()
         return jsonify({
-            "uptime_s":   int(time.time() - startup_time),
-            "requests":   request_count,
-            "diag_mode":  DIAG_MODE,
-            "zones":      {k: {**v, "expires_in": max(0, int(v["expires"] - time.time()))} for k, v in zone_state.items()},
-            "pending":    {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in pending.items()},
-            "mt5_queue":  mt5_queue,
-            "risk_wait":  {k: v for k, v in risk_state.items() if v.get("waiting_risk")},
-            "last_signal": last_signal_log,
+            "version":        "4.2",
+            "uptime_s":       int(time.time() - startup_time),
+            "requests":       request_count,
+            "diag_mode":      DIAG_MODE,
+            "public_channel": PUBLIC_CHAT_ID,
+            "zones":          {k: {**v, "expires_in": max(0, int(v["expires"] - time.time()))} for k, v in zone_state.items()},
+            "pending":        {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in pending.items()},
+            "mt5_queue":      mt5_queue,
+            "risk_wait":      {k: v for k, v in risk_state.items() if v.get("waiting_risk")},
+            "last_signal":    last_signal_log,
         }), 200
 
 
