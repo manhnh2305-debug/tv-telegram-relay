@@ -171,7 +171,7 @@ def send_diag(text):
 def send_public_signal(sig, fill_detail=""):
     """
     Post signal sang kênh public khi MT5 FILLED.
-    Dùng chung BOT_TOKEN — bot đã là admin của cả 2 kênh.
+    v4.2: English, TP1+TP2, reason, no lot/spread, vivid emoji.
     """
     if not PUBLIC_CHAT_ID:
         log.warning("PUBLIC_CHAT_ID not set — skipping public post")
@@ -183,34 +183,59 @@ def send_public_signal(sig, fill_detail=""):
     sl      = sig.get("sl", "—")
     tp      = sig.get("tp", "—")
     tf      = sig.get("tf", "M5")
+    sig_type = sig.get("signal_type", "vsa")
+    trend    = sig.get("trend", "")
+    mode     = sig.get("mode", "")
+    harsi    = sig.get("harsi", "")
 
-    # Tính RR
-    rr_text = f"1:{DEFAULT_RR}"
+    # ── Tính TP1 (RR 1:1) và TP2 (RR 1:2) ──
+    tp1 = "—"
+    tp2 = "—"
     try:
         p = float(price)
         s = float(sl)
-        t = float(tp)
         risk_dist = abs(p - s)
-        reward_dist = abs(t - p)
         if risk_dist > 0:
-            rr_text = f"1:{reward_dist / risk_dist:.1f}"
+            if action == "BUY":
+                tp1 = f"{p + risk_dist:.1f}"
+                tp2 = f"{p + risk_dist * 2:.1f}"
+            else:
+                tp1 = f"{p - risk_dist:.1f}"
+                tp2 = f"{p - risk_dist * 2:.1f}"
     except (ValueError, TypeError, ZeroDivisionError):
-        pass
+        tp1 = str(tp)
+        tp2 = "—"
 
-    emoji = "🟢" if action == "BUY" else "🔴"
-    direction = action.upper()
+    # ── Reason / lý do vào lệnh ──
+    if sig_type == "div":
+        reason = "HARSI divergence + VSA confirmation"
+    else:
+        reason = "VSA engulfing + volume shift"
+    if trend:
+        reason += f" | Trend: {trend}"
+    if mode:
+        reason += f" ({mode})"
 
-    # Lot info từ fill_detail (format: "0.02 lot @ spread $5.70")
-    lot_line = f"\n📦 {fill_detail}" if fill_detail else ""
+    # ── Emoji & header ──
+    if action == "BUY":
+        emoji = "🟢"
+        arrow = "🚀"
+        direction = "BUY"
+    else:
+        emoji = "🔴"
+        arrow = "📉"
+        direction = "SELL"
 
     text = (
-        f"{emoji} <b>{direction} {symbol}</b>\n"
-        f"━━━━━━━━━━━━━━━━━\n"
+        f"{arrow} <b>{emoji} {direction} {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry: <b>{price}</b>\n"
-        f"🛑 SL: <b>{sl}</b>\n"
-        f"🎯 TP: <b>{tp}</b>  |  RR {rr_text}\n"
-        f"⏰ {now_ict()}  |  {tf}"
-        f"{lot_line}\n\n"
+        f"🛡 SL: <b>{sl}</b>\n"
+        f"🎯 TP1: <b>{tp1}</b>  ⟹  RR 1:1\n"
+        f"🏆 TP2: <b>{tp2}</b>  ⟹  RR 1:2\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>{reason}</i>\n"
+        f"🕐 {now_ict()}  •  {tf}\n\n"
         f"#signal #{symbol} #{direction.lower()}"
     )
 
@@ -659,7 +684,12 @@ def webhook_tg():
                     "risk_usd": risk_usd,
                     "tf":       tf,
                     "max_dev":  MAX_PRICE_DEV,
-                    "created":  time.time()
+                    "created":  time.time(),
+                    # v4.2: giữ data cho public post
+                    "signal_type": sig.get("signal_type", "vsa"),
+                    "trend":       sig.get("trend", ""),
+                    "mode":        sig.get("mode", ""),
+                    "harsi":       sig.get("harsi", ""),
                 }
 
                 del risk_state[active_cb]
