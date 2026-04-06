@@ -1,7 +1,10 @@
 """
-TV → Telegram → MT5 Relay Server v4.2
+TV → Telegram → MT5 Relay Server v4.2.1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Changes từ v4.1:
+Changes từ v4.2:
+  ✅ v4.2.1: Bypass zone check khi zone_type = "NONE" (indicator zone filter OFF)
+  ✅ v4.2.1: MAX_PRICE_DEV default 10 (phù hợp XAUUSD spread)
+  ─── v4.2 features giữ nguyên ───
   ✅ v4.2: Auto post signal sang kênh PUBLIC khi MT5 FILLED
   ✅ v4.2: Format message đẹp cho kênh public (hashtag, RR, lot info)
   ─── v4.1 features giữ nguyên ───
@@ -25,10 +28,10 @@ app = Flask(__name__)
 
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "")
 CHAT_ID         = os.environ.get("CHAT_ID", "")
-PUBLIC_CHAT_ID  = os.environ.get("PUBLIC_CHAT_ID", "@goldsignalnodelete")  # v4.2
+PUBLIC_CHAT_ID  = os.environ.get("PUBLIC_CHAT_ID", "@goldsignalnodelete")
 API_KEY         = os.environ.get("API_KEY", "changeme")
 SYMBOL_SUFFIX   = os.environ.get("SYMBOL_SUFFIX", "")
-MAX_PRICE_DEV   = float(os.environ.get("MAX_PRICE_DEV", "5"))
+MAX_PRICE_DEV   = float(os.environ.get("MAX_PRICE_DEV", "10"))   # v4.2.1: 5 → 10 cho XAUUSD
 DEFAULT_RR      = float(os.environ.get("DEFAULT_RR", "2.0"))
 ZONE_TTL        = int(os.environ.get("ZONE_TTL", "14400"))
 ORDER_TTL       = int(os.environ.get("ORDER_TTL", "300"))
@@ -36,7 +39,6 @@ SHEET_URL       = os.environ.get("SHEET_URL", "")
 STATE_FILE      = "/tmp/relay_state.json"
 ICT             = timezone(timedelta(hours=7))
 
-# ─── Diagnostic config ────────────────────────────────────────────────────────
 DIAG_MODE       = os.environ.get("DIAG_MODE", "true").lower() == "true"
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
@@ -56,7 +58,6 @@ mt5_queue    = {}
 risk_state   = {}
 seen_signals = {}
 
-# ── Diagnostic state ──
 last_signal_log = {}
 startup_time    = time.time()
 request_count   = {"signal": 0, "alert": 0, "mt5_poll": 0}
@@ -120,9 +121,9 @@ def request_timer(f):
         result = f(*args, **kwargs)
         elapsed = (time.time() - start) * 1000
         if elapsed > 2000:
-            log.warning(f"⚠️ SLOW REQUEST: {f.__name__} took {elapsed:.0f}ms")
+            log.warning(f"SLOW REQUEST: {f.__name__} took {elapsed:.0f}ms")
             if DIAG_MODE:
-                send_text(f"⚠️ <b>Slow request</b>: {f.__name__} — {elapsed:.0f}ms")
+                send_text(f"<b>Slow request</b>: {f.__name__} — {elapsed:.0f}ms")
         return result
     return wrapper
 
@@ -137,8 +138,8 @@ def cleanup():
         if now - mt5_queue[oid].get("created", 0) > ORDER_TTL:
             expired = mt5_queue.pop(oid)
             log.warning(f"Order expired: {oid}")
-            send_text(f"⚠️ <b>Order hết hạn</b> — EA không poll trong {ORDER_TTL}s\n"
-                      f"📍 {expired.get('action')} {expired.get('symbol')} @ {expired.get('price')}")
+            send_text(f"<b>Order het han</b> — EA khong poll trong {ORDER_TTL}s\n"
+                      f"{expired.get('action')} {expired.get('symbol')} @ {expired.get('price')}")
     for h in list(seen_signals):
         if now - seen_signals[h] > 60:
             del seen_signals[h]
@@ -163,16 +164,12 @@ def send_text(text, reply_markup=None):
 
 def send_diag(text):
     if DIAG_MODE:
-        send_text(f"🔍 <b>DIAG</b>\n{text}")
+        send_text(f"<b>DIAG</b>\n{text}")
 
 
 # ─── v4.2: Public Channel Post ────────────────────────────────────────────────
 
 def send_public_signal(sig, fill_detail=""):
-    """
-    Post signal sang kênh public khi MT5 FILLED.
-    v4.2: English, TP1+TP2, reason, no lot/spread, vivid emoji.
-    """
     if not PUBLIC_CHAT_ID:
         log.warning("PUBLIC_CHAT_ID not set — skipping public post")
         return
@@ -186,9 +183,7 @@ def send_public_signal(sig, fill_detail=""):
     sig_type = sig.get("signal_type", "vsa")
     trend    = sig.get("trend", "")
     mode     = sig.get("mode", "")
-    harsi    = sig.get("harsi", "")
 
-    # ── Tính TP1 (RR 1:1) và TP2 (RR 1:2) ──
     tp1 = "—"
     tp2 = "—"
     try:
@@ -206,7 +201,6 @@ def send_public_signal(sig, fill_detail=""):
         tp1 = str(tp)
         tp2 = "—"
 
-    # ── Reason / lý do vào lệnh ──
     if sig_type == "div":
         reason = "HARSI divergence + VSA confirmation"
     else:
@@ -216,14 +210,13 @@ def send_public_signal(sig, fill_detail=""):
     if mode:
         reason += f" ({mode})"
 
-    # ── Emoji & header ──
     if action == "BUY":
-        emoji = "🟢"
         arrow = "🚀"
+        emoji = "🟢"
         direction = "BUY"
     else:
-        emoji = "🔴"
         arrow = "📉"
+        emoji = "🔴"
         direction = "SELL"
 
     text = (
@@ -231,8 +224,8 @@ def send_public_signal(sig, fill_detail=""):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry: <b>{price}</b>\n"
         f"🛡 SL: <b>{sl}</b>\n"
-        f"🎯 TP1: <b>{tp1}</b>  ⟹  RR 1:1\n"
-        f"🏆 TP2: <b>{tp2}</b>  ⟹  RR 1:2\n"
+        f"🎯 TP1: <b>{tp1}</b>  — RR 1:1\n"
+        f"🏆 TP2: <b>{tp2}</b>  — RR 1:2\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💡 <i>{reason}</i>\n"
         f"🕐 {now_ict()}  •  {tf}\n\n"
@@ -248,15 +241,14 @@ def send_public_signal(sig, fill_detail=""):
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.ok:
-            log.info(f"✅ Public signal posted: {direction} {symbol} @ {price}")
-            # Notify kênh private rằng đã post public
-            send_text(f"📢 Đã post signal <b>{direction} {symbol}</b> sang kênh public")
+            log.info(f"Public signal posted: {direction} {symbol} @ {price}")
+            send_text(f"📢 Da post signal <b>{direction} {symbol}</b> sang kenh public")
         else:
-            log.error(f"❌ Public post failed: {r.status_code} {r.text[:200]}")
-            send_text(f"❌ <b>Public post FAILED</b>: {r.status_code}\n<code>{r.text[:200]}</code>")
+            log.error(f"Public post failed: {r.status_code} {r.text[:200]}")
+            send_text(f"<b>Public post FAILED</b>: {r.status_code}\n<code>{r.text[:200]}</code>")
     except Exception as e:
-        log.error(f"❌ Public post exception: {e}")
-        send_text(f"❌ <b>Public post ERROR</b>: {e}")
+        log.error(f"Public post exception: {e}")
+        send_text(f"<b>Public post ERROR</b>: {e}")
 
 
 # ─── More Helpers ──────────────────────────────────────────────────────────────
@@ -379,24 +371,24 @@ def send_signal_message(data, callback_id):
     header   = f"{tf_emoji} <b>SIGNAL {action} — {symbol} {tf}</b>"
     type_tag = "📐 Divergence" if sig_type == "div" else "📊 VSA Engulf"
 
-    sl_line = f"🛑 SL: <b>{sl}</b>\n" if sl else "⚠️ SL: <i>chưa xác định</i>\n"
+    sl_line = f"🛑 SL: <b>{sl}</b>\n" if sl else "⚠️ SL: <i>chua xac dinh</i>\n"
     tp_line = f"🎯 TP: <b>{tp}</b>  (RR 1:{DEFAULT_RR})\n" if tp else ""
 
     text = (
         f"{header}\n"
         f"━━━━━━━━━━━━━━━━━\n"
-        f"📍 Giá: <b>{price}</b>\n"
+        f"📍 Gia: <b>{price}</b>\n"
         f"📊 HARSI: {harsi}\n"
         f"🏷 Type: {type_tag}\n"
         f"{sl_line}{tp_line}"
         f"⏰ {now_ict()}\n"
-        f"🔗 <a href='{chart}'>Mở chart {tf}</a>\n\n"
-        f"👉 Xác nhận vào lệnh:"
+        f"🔗 <a href='{chart}'>Mo chart {tf}</a>\n\n"
+        f"👉 Xac nhan vao lenh:"
     )
 
     keyboard = {"inline_keyboard": [[
         {"text": f"{emoji} {action}", "callback_data": f"confirm_{callback_id}_{action}"},
-        {"text": "❌ Bỏ qua",         "callback_data": f"skip_{callback_id}"}
+        {"text": "❌ Bo qua",         "callback_data": f"skip_{callback_id}"}
     ]]}
     send_text(text, keyboard)
 
@@ -405,7 +397,7 @@ def send_signal_message(data, callback_id):
 
 def notify_startup():
     send_text(
-        f"🚀 <b>Relay Server v4.2 started</b>\n"
+        f"🚀 <b>Relay Server v4.2.1 started</b>\n"
         f"⏰ {now_ict_full()}\n"
         f"📊 State: {len(mt5_queue)} orders, {len(pending)} pending, {len(zone_state)} zones\n"
         f"🔍 Diag mode: {'ON' if DIAG_MODE else 'OFF'}\n"
@@ -425,7 +417,7 @@ def health():
         cleanup()
     return jsonify({
         "status":         "ok",
-        "version":        "4.2",
+        "version":        "4.2.1",
         "uptime_s":       int(time.time() - startup_time),
         "pending":        len(pending),
         "mt5_queue":      len(mt5_queue),
@@ -486,13 +478,13 @@ def alert():
     emoji   = "🔴" if zone_type == "RESISTANCE" else "🟢"
     sl_info = f"\n📐 Box: {zone_bottom} — {zone_top}" if zone_top and zone_bottom else ""
     text = (
-        f"{emoji} <b>{symbol}</b> — Giá vào vùng <b>{zone_type}</b>\n"
+        f"{emoji} <b>{symbol}</b> — Gia vao vung <b>{zone_type}</b>\n"
         f"━━━━━━━━━━━━━━━━━\n"
-        f"📍 Giá: <b>{price}</b>"
+        f"📍 Gia: <b>{price}</b>"
         f"{sl_info}\n"
         f"⏰ {now_ict()}\n"
         f"{'📝 ' + note + chr(10) if note else ''}"
-        f"\n👀 <i>Đang theo dõi setup M5 / M15...</i>"
+        f"\n👀 <i>Dang theo doi setup M5 / M15...</i>"
     )
     send_text(text)
     return jsonify({"status": "zone_active", "symbol": symbol}), 200
@@ -503,15 +495,15 @@ def alert():
 def signal_route():
     if not verify_api_key():
         log.warning(f"Unauthorized /signal from {request.remote_addr}")
-        send_diag(f"❌ Unauthorized /signal từ {request.remote_addr}")
+        send_diag(f"Unauthorized /signal tu {request.remote_addr}")
         return jsonify({"error": "unauthorized"}), 401
 
     raw = request.data.decode("utf-8", errors="replace").strip()
     raw = raw.lstrip("\ufeff\u200b\u00a0")
 
-    log.info(f"📨 /signal raw ({len(raw)} bytes): {repr(raw[:300])}")
+    log.info(f"/signal raw ({len(raw)} bytes): {repr(raw[:300])}")
     send_diag(
-        f"📦 Raw body ({len(raw)} bytes):\n"
+        f"Raw body ({len(raw)} bytes):\n"
         f"<code>{raw[:400]}</code>"
     )
 
@@ -522,31 +514,32 @@ def signal_route():
         except Exception as e:
             log.warning(f"JSON parse failed: {e}")
             send_diag(
-                f"❌ JSON parse FAILED:\n"
-                f"🐛 Error: <code>{str(e)[:200]}</code>\n"
-                f"📦 Body: <code>{raw[:400]}</code>"
+                f"JSON parse FAILED:\n"
+                f"Error: <code>{str(e)[:200]}</code>\n"
+                f"Body: <code>{raw[:400]}</code>"
             )
             return jsonify({"error": "invalid body"}), 400
 
     if not data:
-        send_diag(f"❌ Body rỗng hoặc không có data\nContent-Type: <code>{request.content_type}</code>")
+        send_diag(f"Body rong\nContent-Type: <code>{request.content_type}</code>")
         return jsonify({"error": "empty body"}), 400
 
     symbol = data.get("symbol", "XAUUSD")
     action = data.get("action", "")
     price  = data.get("price", "")
     tf     = data.get("tf", "M5")
-    sig_type = data.get("signal_type", "vsa")
+    sig_type  = data.get("signal_type", "vsa")
+    zone_type = data.get("zone_type", "").upper()
 
     with lock:
         request_count["signal"] += 1
         cleanup()
 
-        log.info(f"📨 Signal received: {action} {symbol} @ {price} [{sig_type}] {tf}")
+        log.info(f"Signal received: {action} {symbol} @ {price} [{sig_type}] {tf}")
         send_diag(
-            f"📨 Signal nhận: <b>{action} {symbol}</b> @ {price}\n"
-            f"🏷 Type: {sig_type} | TF: {tf}\n"
-            f"📦 Raw: <code>{json.dumps(data, ensure_ascii=False)[:300]}</code>"
+            f"Signal nhan: <b>{action} {symbol}</b> @ {price}\n"
+            f"Type: {sig_type} | TF: {tf} | Zone: {zone_type}\n"
+            f"Raw: <code>{json.dumps(data, ensure_ascii=False)[:300]}</code>"
         )
 
         sig_top = 0
@@ -557,41 +550,63 @@ def signal_route():
         except Exception:
             pass
 
-        if sig_top > 0 and sig_bot > 0:
-            zone_state[symbol] = {
-                "active":  True,
-                "expires": time.time() + ZONE_TTL,
-                "type":    data.get("zone_type", "ZONE").upper(),
-                "top":     sig_top,
-                "bottom":  sig_bot,
-            }
-            log.info(f"Zone auto-activated: {symbol} [{sig_bot} - {sig_top}]")
+        # ── v4.2.1 FIX 1: Bypass zone check khi zone_type = "NONE" ──
+        # Indicator gui zone_type="NONE" khi zone filter OFF
+        # → skip zone check, dung div_sl de tinh SL/TP
+        bypass_zone = (zone_type == "NONE")
 
-        zs = zone_state.get(symbol)
+        if not bypass_zone:
+            # Logic zone goc v4.2
+            if sig_top > 0 and sig_bot > 0:
+                zone_state[symbol] = {
+                    "active":  True,
+                    "expires": time.time() + ZONE_TTL,
+                    "type":    zone_type,
+                    "top":     sig_top,
+                    "bottom":  sig_bot,
+                }
+                log.info(f"Zone auto-activated: {symbol} [{sig_bot} - {sig_top}]")
 
-        if not zs or not zs.get("active") or time.time() > zs.get("expires", 0):
-            reason = "zone_not_active"
-            log.info(f"Signal IGNORED — {reason}: {symbol}")
-            send_diag(
-                f"⏭ Signal <b>IGNORED</b>: {action} {symbol}\n"
-                f"❓ Lý do: Zone không active\n"
-                f"📋 Zones hiện tại: {list(zone_state.keys())}"
-            )
-            last_signal_log.update({"time": now_ict_full(), "data": data, "result": reason})
-            return jsonify({"status": "ignored", "reason": reason}), 200
+            zs = zone_state.get(symbol)
 
+            if not zs or not zs.get("active") or time.time() > zs.get("expires", 0):
+                reason = "zone_not_active"
+                log.info(f"Signal IGNORED — {reason}: {symbol}")
+                send_diag(
+                    f"Signal <b>IGNORED</b>: {action} {symbol}\n"
+                    f"Ly do: Zone khong active\n"
+                    f"Zones hien tai: {list(zone_state.keys())}"
+                )
+                last_signal_log.update({"time": now_ict_full(), "data": data, "result": reason})
+                return jsonify({"status": "ignored", "reason": reason}), 200
+        else:
+            zs = None
+            log.info(f"Zone bypass: zone_type=NONE, dung div_sl de tinh SL/TP")
+
+        # Duplicate check
         sh = signal_hash(data)
         if sh in seen_signals:
             reason = "duplicate"
             log.warning(f"Signal DUPLICATE ignored: {symbol} {action}")
-            send_diag(f"⏭ Signal <b>DUPLICATE</b>: {action} {symbol} @ {price}")
+            send_diag(f"Signal <b>DUPLICATE</b>: {action} {symbol} @ {price}")
             last_signal_log.update({"time": now_ict_full(), "data": data, "result": reason})
             return jsonify({"status": "ignored", "reason": reason}), 200
         seen_signals[sh] = time.time()
 
+        # SL/TP calculation
         div_sl = data.get("div_sl")
 
         if div_sl and sig_type == "div":
+            # Divergence: dung div_sl tu indicator
+            try:
+                sl = round(float(div_sl), 2)
+                price_f = float(price)
+                risk = abs(price_f - sl)
+                tp = round(price_f + risk * DEFAULT_RR, 2) if action == "BUY" else round(price_f - risk * DEFAULT_RR, 2)
+            except Exception:
+                sl, tp = None, None
+        elif bypass_zone and div_sl:
+            # Zone bypass + engulf: van dung div_sl (thuc ra la engulf SL)
             try:
                 sl = round(float(div_sl), 2)
                 price_f = float(price)
@@ -600,7 +615,8 @@ def signal_route():
             except Exception:
                 sl, tp = None, None
         else:
-            sl, tp = calc_sl_tp(action, price, zs.get("top", 0), zs.get("bottom", 0))
+            # Zone active: tinh SL/TP tu zone
+            sl, tp = calc_sl_tp(action, price, zs.get("top", 0) if zs else 0, zs.get("bottom", 0) if zs else 0)
 
         data["sl"] = sl
         data["tp"] = tp
@@ -609,14 +625,12 @@ def signal_route():
             reason = "no_sl"
             log.warning(f"Signal REJECTED — cannot calc SL: {action} {symbol} @ {price}")
             send_diag(
-                f"❌ Signal <b>REJECTED</b>: {action} {symbol}\n"
-                f"❓ Lý do: Không tính được SL\n"
-                f"📐 Zone: {zs.get('bottom')} — {zs.get('top')}\n"
-                f"📍 Price: {price} | div_sl: {div_sl}"
+                f"Signal <b>REJECTED</b>: {action} {symbol}\n"
+                f"Ly do: Khong tinh duoc SL\n"
+                f"Price: {price} | div_sl: {div_sl} | bypass_zone: {bypass_zone}"
             )
-            send_text(f"⚠️ <b>Signal rejected</b> — Không thể tính SL\n"
-                      f"📍 {action} {symbol} @ {price}\n"
-                      f"Zone: {zs.get('bottom')} — {zs.get('top')}")
+            send_text(f"<b>Signal rejected</b> — Khong the tinh SL\n"
+                      f"{action} {symbol} @ {price}")
             last_signal_log.update({"time": now_ict_full(), "data": data, "result": reason})
             return jsonify({"status": "rejected", "reason": reason}), 200
 
@@ -639,7 +653,6 @@ def signal_route():
 def webhook_tg():
     update = request.get_json(force=True, silent=True) or {}
 
-    # ── Text reply (risk USD) ──
     msg = update.get("message", {})
     if msg:
         chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -659,7 +672,7 @@ def webhook_tg():
                     if risk_usd <= 0 or risk_usd > 10000:
                         raise ValueError("out of range")
                 except ValueError:
-                    send_text("⚠️ Vui lòng nhập số tiền hợp lệ (1 - 10000 USD)")
+                    send_text("Vui long nhap so tien hop le (1 - 10000 USD)")
                     return jsonify({"ok": True}), 200
 
                 sig      = pending.pop(active_cb, {})
@@ -685,7 +698,6 @@ def webhook_tg():
                     "tf":       tf,
                     "max_dev":  MAX_PRICE_DEV,
                     "created":  time.time(),
-                    # v4.2: giữ data cho public post
                     "signal_type": sig.get("signal_type", "vsa"),
                     "trend":       sig.get("trend", ""),
                     "mode":        sig.get("mode", ""),
@@ -697,17 +709,16 @@ def webhook_tg():
 
                 log.info(f"Order queued: {order_id} — {action} {mt5_symbol} risk=${risk_usd}")
                 send_text(
-                    f"{emoji} <b>ĐÃ XÁC NHẬN {action}</b> — {symbol}\n"
+                    f"{emoji} <b>DA XAC NHAN {action}</b> — {symbol}\n"
                     f"📍 Entry: {price} | {tf}\n"
                     f"🛑 SL: {sl}\n"
                     f"🎯 TP: {tp}  (RR 1:{DEFAULT_RR})\n"
                     f"💰 Risk: ${risk_usd}\n"
                     f"⏰ {now_ict()}\n"
-                    f"⏳ <i>Đang chờ EA MT5 thực thi...</i>"
+                    f"⏳ <i>Dang cho EA MT5 thuc thi...</i>"
                 )
                 return jsonify({"ok": True}), 200
 
-    # ── Callback query (inline buttons) ──
     cq = update.get("callback_query")
     if not cq:
         return jsonify({"ok": True}), 200
@@ -726,15 +737,15 @@ def webhook_tg():
         with lock:
             sig = pending.get(callback_id, {})
             if not sig:
-                answer_callback(cq_id, "⚠️ Signal đã hết hạn")
+                answer_callback(cq_id, "Signal da het han")
                 return jsonify({"ok": True}), 200
 
-            answer_callback(cq_id, "✅ Nhập số tiền risk tối đa (USD)")
+            answer_callback(cq_id, "Nhap so tien risk toi da (USD)")
             edit_message(chat_id, msg_id,
-                f"{'🔴' if action == 'SELL' else '🟢'} <b>XÁC NHẬN {action}</b> — {sig.get('symbol','XAUUSD')}\n"
+                f"{'🔴' if action == 'SELL' else '🟢'} <b>XAC NHAN {action}</b> — {sig.get('symbol','XAUUSD')}\n"
                 f"📍 Entry: {sig.get('price','—')} | SL: {sig.get('sl','—')} | TP: {sig.get('tp','—')}\n\n"
-                f"💰 <b>Reply với số tiền risk tối đa (USD)</b>\n"
-                f"<i>Ví dụ: 50</i>"
+                f"💰 <b>Reply voi so tien risk toi da (USD)</b>\n"
+                f"<i>Vi du: 50</i>"
             )
 
             risk_state[callback_id] = {
@@ -752,9 +763,9 @@ def webhook_tg():
             risk_state.pop(cb_id, None)
             save_state()
 
-        answer_callback(cq_id, "❌ Đã bỏ qua")
+        answer_callback(cq_id, "Da bo qua")
         edit_message(chat_id, msg_id,
-            f"❌ <b>Đã bỏ qua</b> — {sig.get('symbol','XAUUSD')} {sig.get('tf','')}\n"
+            f"❌ <b>Da bo qua</b> — {sig.get('symbol','XAUUSD')} {sig.get('tf','')}\n"
             f"⏰ {now_ict()}"
         )
 
@@ -803,7 +814,6 @@ def mt5_ack():
 
             if status == "filled":
                 sync_sheet(sig, detail)
-                # ── v4.2: Post sang kênh public ──
                 send_public_signal(sig, detail)
         else:
             log.warning(f"Ack for unknown order: {order_id}")
@@ -826,7 +836,7 @@ def status():
     with lock:
         cleanup()
         return jsonify({
-            "version":        "4.2",
+            "version":        "4.2.1",
             "uptime_s":       int(time.time() - startup_time),
             "requests":       request_count,
             "diag_mode":      DIAG_MODE,
