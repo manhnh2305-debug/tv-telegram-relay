@@ -1,20 +1,14 @@
 """
-TV → Telegram → MT5 Relay Server v4.2.1
+TV → Telegram → MT5 Relay Server v4.2.2
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Changes từ v4.2:
-  ✅ v4.2.1: Bypass zone check khi zone_type = "NONE" (indicator zone filter OFF)
-  ✅ v4.2.1: MAX_PRICE_DEV default 10 (phù hợp XAUUSD spread)
-  ─── v4.2 features giữ nguyên ───
+Changes từ v4.2.1:
+  ✅ v4.2.2: FIX sync_sheet — thêm type:"trade", match field names với saveTrade()
+  ✅ v4.2.2: sync_sheet gửi đủ date, time, symbol, dir, lot, open, sl, tp, rr, spread, order_id
+  ✅ v4.2.2: Bỏ duplicate — chỉ Relay ghi sheet (EA LogToSheet đã disable)
+  ✅ v4.2.2: Truyền order_id vào sync_sheet để dedup
+  ─── v4.2.1 features giữ nguyên ───
+  ✅ v4.2.1: Bypass zone check khi zone_type = "NONE"
   ✅ v4.2: Auto post signal sang kênh PUBLIC khi MT5 FILLED
-  ✅ v4.2: Format message đẹp cho kênh public (hashtag, RR, lot info)
-  ─── v4.1 features giữ nguyên ───
-  ✅ Telegram diagnostic log
-  ✅ /ping endpoint nhẹ cho UptimeRobot
-  ✅ Request timing
-  ✅ Startup notify
-  ✅ Signal retry buffer
-  ✅ /debug/last endpoint
-  ✅ Zone auto-activate luôn ghi log chi tiết
 """
 
 import os, json, time, uuid, hashlib, logging, requests
@@ -31,7 +25,7 @@ CHAT_ID         = os.environ.get("CHAT_ID", "")
 PUBLIC_CHAT_ID  = os.environ.get("PUBLIC_CHAT_ID", "@goldsignalnodelete")
 API_KEY         = os.environ.get("API_KEY", "changeme")
 SYMBOL_SUFFIX   = os.environ.get("SYMBOL_SUFFIX", "")
-MAX_PRICE_DEV   = float(os.environ.get("MAX_PRICE_DEV", "10"))   # v4.2.1: 5 → 10 cho XAUUSD
+MAX_PRICE_DEV   = float(os.environ.get("MAX_PRICE_DEV", "10"))
 DEFAULT_RR      = float(os.environ.get("DEFAULT_RR", "2.0"))
 ZONE_TTL        = int(os.environ.get("ZONE_TTL", "14400"))
 ORDER_TTL       = int(os.environ.get("ORDER_TTL", "300"))
@@ -102,6 +96,16 @@ def now_ict():
 
 def now_ict_full():
     return datetime.now(ICT).strftime("%H:%M:%S ICT %d/%m")
+
+
+def now_ict_date():
+    """Return yyyy-MM-dd in ICT"""
+    return datetime.now(ICT).strftime("%Y-%m-%d")
+
+
+def now_ict_time():
+    """Return HH:MM in ICT"""
+    return datetime.now(ICT).strftime("%H:%M")
 
 
 def verify_api_key():
@@ -251,7 +255,89 @@ def send_public_signal(sig, fill_detail=""):
         send_text(f"<b>Public post ERROR</b>: {e}")
 
 
-# ─── More Helpers ──────────────────────────────────────────────────────────────
+# ─── v4.2.2: FIXED sync_sheet ─────────────────────────────────────────────────
+
+def sync_sheet(sig, lot_str="", order_id=""):
+    """
+    Ghi trade log vào Google Sheet qua Apps Script.
+    v4.2.2 FIX: Thêm type:"trade" + match đúng field names.
+    """
+    if not SHEET_URL:
+        log.warning("SHEET_URL not set — skipping sheet log")
+        return
+
+    try:
+        symbol  = sig.get("symbol", "XAUUSD").replace(SYMBOL_SUFFIX, "")
+        action  = sig.get("action", "")
+        entry   = sig.get("price", 0)
+        sl      = sig.get("sl", 0)
+        tp      = sig.get("tp", 0)
+        tf      = sig.get("tf", "M5")
+        risk_usd = sig.get("risk_usd", 0)
+        sig_type = sig.get("signal_type", "vsa")
+
+        # Parse lot từ ack detail string: "0.01 lot @ spread $5.70"
+        lot = 0.01
+        spread = 0
+        if lot_str:
+            parts = lot_str.split()
+            if parts:
+                try:
+                    lot = float(parts[0])
+                except ValueError:
+                    pass
+            # Extract spread from "... spread $5.70"
+            if "spread" in lot_str:
+                try:
+                    spread_idx = lot_str.index("$") + 1
+                    spread = float(lot_str[spread_idx:])
+                except (ValueError, IndexError):
+                    pass
+
+        # Tính RR
+        rr = ""
+        try:
+            e = float(entry)
+            s = float(sl)
+            t = float(tp)
+            risk = abs(e - s)
+            reward = abs(t - e)
+            if risk > 0:
+                rr = round(reward / risk, 2)
+        except (ValueError, TypeError, ZeroDivisionError):
+            pass
+
+        # ── Build payload match saveTrade() trong Apps Script ──
+        # saveTrade chấp nhận: type, date, time, symbol, dir, lot, open,
+        #                      sl, tp, rr, spread, order_id, source, reason
+        payload = {
+            "type":     "trade",           # ← FIX: bắt buộc để route đúng
+            "date":     now_ict_date(),     # yyyy-MM-dd
+            "time":     now_ict_time(),     # HH:MM
+            "symbol":   symbol,
+            "dir":      action,            # ← FIX: dùng "dir" thay vì "direction"
+            "lot":      lot,
+            "open":     entry,             # ← FIX: dùng "open" thay vì "entry"
+            "sl":       sl,
+            "tp":       tp,
+            "rr":       rr,
+            "spread":   spread,
+            "order_id": order_id,
+            "source":   "Relay",
+            "reason":   f"SemiAutoEA {tf} — {'Divergence' if sig_type == 'div' else 'VSA+HARSI'} signal",
+        }
+
+        r = requests.post(SHEET_URL, json=payload, timeout=10)
+        if r.status_code in (200, 302):
+            log.info(f"Sheet logged: {action} {symbol} {lot} lot @ {entry}")
+        else:
+            log.error(f"Sheet log failed: HTTP {r.status_code} — {r.text[:200]}")
+            send_text(f"⚠️ <b>Sheet log failed</b>: HTTP {r.status_code}")
+
+    except Exception as e:
+        log.error(f"Sheet sync failed: {e}")
+        send_text(f"⚠️ <b>Sheet sync error</b>: {e}")
+
 
 def calc_pnl_usd(symbol, lots, entry, exit_price):
     try:
@@ -274,41 +360,6 @@ def calc_pnl_usd(symbol, lots, entry, exit_price):
             return (dist / 0.0001) * 10 * lots
     except Exception:
         return 0
-
-
-def sync_sheet(sig, lot_str=""):
-    if not SHEET_URL:
-        return
-    try:
-        symbol  = sig.get("symbol", "XAUUSD").replace(SYMBOL_SUFFIX, "")
-        action  = sig.get("action", "")
-        entry   = sig.get("price", 0)
-        sl      = sig.get("sl", 0)
-        tp      = sig.get("tp", 0)
-        tf      = sig.get("tf", "M5")
-        lot = 0.01
-        if lot_str:
-            parts = lot_str.split()
-            if parts:
-                try:
-                    lot = float(parts[0])
-                except ValueError:
-                    pass
-        sl_pnl = calc_pnl_usd(symbol, lot, entry, sl) if sl else 0
-        tp_pnl = calc_pnl_usd(symbol, lot, entry, tp) if tp else 0
-        rr = f"1:{tp_pnl/sl_pnl:.2f}" if sl_pnl > 0 else "-"
-        direction = "LONG" if action == "BUY" else "SHORT"
-        payload = {
-            "time": now_ict(), "pair": symbol, "direction": direction,
-            "lot": lot, "entry": entry, "sl": sl, "tp": tp,
-            "maxLoss": f"{sl_pnl:.2f}", "maxProfit": f"{tp_pnl:.2f}",
-            "rr": rr, "emotion": "confident",
-            "reason": f"SemiAutoEA {tf} — VSA+HARSI signal"
-        }
-        requests.post(SHEET_URL, json=payload, timeout=10)
-        log.info(f"Sheet logged: {direction} {symbol} {lot} lot")
-    except Exception as e:
-        log.error(f"Sheet sync failed: {e}")
 
 
 def edit_message(chat_id, msg_id, text):
@@ -397,7 +448,7 @@ def send_signal_message(data, callback_id):
 
 def notify_startup():
     send_text(
-        f"🚀 <b>Relay Server v4.2.1 started</b>\n"
+        f"🚀 <b>Relay Server v4.2.2 started</b>\n"
         f"⏰ {now_ict_full()}\n"
         f"📊 State: {len(mt5_queue)} orders, {len(pending)} pending, {len(zone_state)} zones\n"
         f"🔍 Diag mode: {'ON' if DIAG_MODE else 'OFF'}\n"
@@ -417,7 +468,7 @@ def health():
         cleanup()
     return jsonify({
         "status":         "ok",
-        "version":        "4.2.1",
+        "version":        "4.2.2",
         "uptime_s":       int(time.time() - startup_time),
         "pending":        len(pending),
         "mt5_queue":      len(mt5_queue),
@@ -550,13 +601,9 @@ def signal_route():
         except Exception:
             pass
 
-        # ── v4.2.1 FIX 1: Bypass zone check khi zone_type = "NONE" ──
-        # Indicator gui zone_type="NONE" khi zone filter OFF
-        # → skip zone check, dung div_sl de tinh SL/TP
         bypass_zone = (zone_type == "NONE")
 
         if not bypass_zone:
-            # Logic zone goc v4.2
             if sig_top > 0 and sig_bot > 0:
                 zone_state[symbol] = {
                     "active":  True,
@@ -583,7 +630,6 @@ def signal_route():
             zs = None
             log.info(f"Zone bypass: zone_type=NONE, dung div_sl de tinh SL/TP")
 
-        # Duplicate check
         sh = signal_hash(data)
         if sh in seen_signals:
             reason = "duplicate"
@@ -593,11 +639,9 @@ def signal_route():
             return jsonify({"status": "ignored", "reason": reason}), 200
         seen_signals[sh] = time.time()
 
-        # SL/TP calculation
         div_sl = data.get("div_sl")
 
         if div_sl and sig_type == "div":
-            # Divergence: dung div_sl tu indicator
             try:
                 sl = round(float(div_sl), 2)
                 price_f = float(price)
@@ -606,7 +650,6 @@ def signal_route():
             except Exception:
                 sl, tp = None, None
         elif bypass_zone and div_sl:
-            # Zone bypass + engulf: van dung div_sl (thuc ra la engulf SL)
             try:
                 sl = round(float(div_sl), 2)
                 price_f = float(price)
@@ -615,7 +658,6 @@ def signal_route():
             except Exception:
                 sl, tp = None, None
         else:
-            # Zone active: tinh SL/TP tu zone
             sl, tp = calc_sl_tp(action, price, zs.get("top", 0) if zs else 0, zs.get("bottom", 0) if zs else 0)
 
         data["sl"] = sl
@@ -813,7 +855,8 @@ def mt5_ack():
             log.info(f"Order ack: {order_id} — {status} {detail}")
 
             if status == "filled":
-                sync_sheet(sig, detail)
+                # v4.2.2: Truyền order_id vào sync_sheet
+                sync_sheet(sig, detail, order_id)
                 send_public_signal(sig, detail)
         else:
             log.warning(f"Ack for unknown order: {order_id}")
@@ -836,7 +879,7 @@ def status():
     with lock:
         cleanup()
         return jsonify({
-            "version":        "4.2.1",
+            "version":        "4.2.2",
             "uptime_s":       int(time.time() - startup_time),
             "requests":       request_count,
             "diag_mode":      DIAG_MODE,
