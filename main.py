@@ -1,7 +1,11 @@
 """
-TV → Telegram → MT5 Relay Server v4.2.2
+TV → Telegram → MT5 Relay Server v4.2.3
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Changes từ v4.2.1:
+Changes từ v4.2.2:
+  ✅ v4.2.3: FIX round SL/TP theo digits per symbol (không hardcode 2)
+  ✅ v4.2.3: FIX send_public_signal format tp1/tp2 per symbol
+  ✅ v4.2.3: FIX sync_sheet RR format "1:X.XX" (cheat sheet logic #4)
+  ─── v4.2.2 features giữ nguyên ───
   ✅ v4.2.2: FIX sync_sheet — thêm type:"trade", match field names với saveTrade()
   ✅ v4.2.2: sync_sheet gửi đủ date, time, symbol, dir, lot, open, sl, tp, rr, spread, order_id
   ✅ v4.2.2: Bỏ duplicate — chỉ Relay ghi sheet (EA LogToSheet đã disable)
@@ -118,6 +122,22 @@ def signal_hash(data):
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+# ── v4.2.3: Price digits per symbol ──────────────────────────────────────────
+# Thay thế round(..., 2) hardcode → round đúng theo symbol
+# Match cheat sheet logic #5 multiplier + broker digits
+def get_digits(symbol):
+    """Return số decimal places cho SL/TP/price per symbol."""
+    s = symbol.upper().replace(SYMBOL_SUFFIX, "")
+    if "XAU" in s:                                      return 2   # 3300.50
+    if "XAG" in s:                                      return 3   # 30.500
+    if "BTC" in s:                                      return 1   # 69670.0
+    if "ETH" in s:                                      return 2   # 3500.00
+    if "OIL" in s or "WTI" in s or "BRENT" in s:       return 3   # 61.500
+    if "NAS" in s or "US30" in s or "US500" in s:       return 2   # 18500.00
+    if "JPY" in s:                                      return 3   # 142.500
+    return 5  # Forex: EURUSD=1.16962, GBPUSD, USDCAD, USDCHF
+
+
 def request_timer(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -188,6 +208,9 @@ def send_public_signal(sig, fill_detail=""):
     trend    = sig.get("trend", "")
     mode     = sig.get("mode", "")
 
+    # v4.2.3: Format theo digits của symbol
+    digits = get_digits(symbol)
+
     tp1 = "—"
     tp2 = "—"
     try:
@@ -196,11 +219,11 @@ def send_public_signal(sig, fill_detail=""):
         risk_dist = abs(p - s)
         if risk_dist > 0:
             if action == "BUY":
-                tp1 = f"{p + risk_dist:.1f}"
-                tp2 = f"{p + risk_dist * 2:.1f}"
+                tp1 = f"{p + risk_dist:.{digits}f}"
+                tp2 = f"{p + risk_dist * 2:.{digits}f}"
             else:
-                tp1 = f"{p - risk_dist:.1f}"
-                tp2 = f"{p - risk_dist * 2:.1f}"
+                tp1 = f"{p - risk_dist:.{digits}f}"
+                tp2 = f"{p - risk_dist * 2:.{digits}f}"
     except (ValueError, TypeError, ZeroDivisionError):
         tp1 = str(tp)
         tp2 = "—"
@@ -261,6 +284,7 @@ def sync_sheet(sig, lot_str="", order_id=""):
     """
     Ghi trade log vào Google Sheet qua Apps Script.
     v4.2.2 FIX: Thêm type:"trade" + match đúng field names.
+    v4.2.3 FIX: RR format "1:X.XX" (cheat sheet logic #4)
     """
     if not SHEET_URL:
         log.warning("SHEET_URL not set — skipping sheet log")
@@ -294,7 +318,7 @@ def sync_sheet(sig, lot_str="", order_id=""):
                 except (ValueError, IndexError):
                     pass
 
-        # Tính RR
+        # v4.2.3 FIX: Tính RR → format "1:X.XX" (cheat sheet logic #4)
         rr = ""
         try:
             e = float(entry)
@@ -303,21 +327,18 @@ def sync_sheet(sig, lot_str="", order_id=""):
             risk = abs(e - s)
             reward = abs(t - e)
             if risk > 0:
-                rr = round(reward / risk, 2)
+                rr = f"1:{reward / risk:.2f}"   # ← FIX: "1:2.33" thay vì 2.33
         except (ValueError, TypeError, ZeroDivisionError):
             pass
 
-        # ── Build payload match saveTrade() trong Apps Script ──
-        # saveTrade chấp nhận: type, date, time, symbol, dir, lot, open,
-        #                      sl, tp, rr, spread, order_id, source, reason
         payload = {
-            "type":     "trade",           # ← FIX: bắt buộc để route đúng
-            "date":     now_ict_date(),     # yyyy-MM-dd
-            "time":     now_ict_time(),     # HH:MM
+            "type":     "trade",
+            "date":     now_ict_date(),
+            "time":     now_ict_time(),
             "symbol":   symbol,
-            "dir":      action,            # ← FIX: dùng "dir" thay vì "direction"
+            "dir":      action,
             "lot":      lot,
-            "open":     entry,             # ← FIX: dùng "open" thay vì "entry"
+            "open":     entry,
             "sl":       sl,
             "tp":       tp,
             "rr":       rr,
@@ -381,9 +402,11 @@ def answer_callback(cq_id, text):
         log.error(f"Telegram callback answer failed: {e}")
 
 
-def calc_sl_tp(action, price, zone_top, zone_bottom, rr=None):
+def calc_sl_tp(action, price, zone_top, zone_bottom, symbol="XAUUSD", rr=None):
+    """v4.2.3: Thêm symbol param → round đúng digits"""
     if rr is None:
         rr = DEFAULT_RR
+    digits = get_digits(symbol)
     try:
         price = float(price)
         if action == "SELL" and zone_top > 0:
@@ -391,15 +414,15 @@ def calc_sl_tp(action, price, zone_top, zone_bottom, rr=None):
             risk = sl - price
             if risk <= 0:
                 return None, None
-            tp = round(price - risk * rr, 2)
-            return round(sl, 2), tp
+            tp = round(price - risk * rr, digits)
+            return round(sl, digits), tp
         elif action == "BUY" and zone_bottom > 0:
             sl = zone_bottom
             risk = price - sl
             if risk <= 0:
                 return None, None
-            tp = round(price + risk * rr, 2)
-            return round(sl, 2), tp
+            tp = round(price + risk * rr, digits)
+            return round(sl, digits), tp
     except Exception:
         pass
     return None, None
@@ -448,7 +471,7 @@ def send_signal_message(data, callback_id):
 
 def notify_startup():
     send_text(
-        f"🚀 <b>Relay Server v4.2.2 started</b>\n"
+        f"🚀 <b>Relay Server v4.2.3 started</b>\n"
         f"⏰ {now_ict_full()}\n"
         f"📊 State: {len(mt5_queue)} orders, {len(pending)} pending, {len(zone_state)} zones\n"
         f"🔍 Diag mode: {'ON' if DIAG_MODE else 'OFF'}\n"
@@ -468,7 +491,7 @@ def health():
         cleanup()
     return jsonify({
         "status":         "ok",
-        "version":        "4.2.2",
+        "version":        "4.2.3",
         "uptime_s":       int(time.time() - startup_time),
         "pending":        len(pending),
         "mt5_queue":      len(mt5_queue),
@@ -582,6 +605,9 @@ def signal_route():
     sig_type  = data.get("signal_type", "vsa")
     zone_type = data.get("zone_type", "").upper()
 
+    # v4.2.3: Lấy digits cho symbol này
+    digits = get_digits(symbol)
+
     with lock:
         request_count["signal"] += 1
         cleanup()
@@ -641,24 +667,28 @@ def signal_route():
 
         div_sl = data.get("div_sl")
 
+        # v4.2.3 FIX: round theo digits thay vì hardcode 2
         if div_sl and sig_type == "div":
             try:
-                sl = round(float(div_sl), 2)
+                sl = round(float(div_sl), digits)
                 price_f = float(price)
                 risk = abs(price_f - sl)
-                tp = round(price_f + risk * DEFAULT_RR, 2) if action == "BUY" else round(price_f - risk * DEFAULT_RR, 2)
+                tp = round(price_f + risk * DEFAULT_RR, digits) if action == "BUY" else round(price_f - risk * DEFAULT_RR, digits)
             except Exception:
                 sl, tp = None, None
         elif bypass_zone and div_sl:
             try:
-                sl = round(float(div_sl), 2)
+                sl = round(float(div_sl), digits)
                 price_f = float(price)
                 risk = abs(price_f - sl)
-                tp = round(price_f + risk * DEFAULT_RR, 2) if action == "BUY" else round(price_f - risk * DEFAULT_RR, 2)
+                tp = round(price_f + risk * DEFAULT_RR, digits) if action == "BUY" else round(price_f - risk * DEFAULT_RR, digits)
             except Exception:
                 sl, tp = None, None
         else:
-            sl, tp = calc_sl_tp(action, price, zs.get("top", 0) if zs else 0, zs.get("bottom", 0) if zs else 0)
+            sl, tp = calc_sl_tp(action, price,
+                                zs.get("top", 0) if zs else 0,
+                                zs.get("bottom", 0) if zs else 0,
+                                symbol)   # ← v4.2.3: truyền symbol
 
         data["sl"] = sl
         data["tp"] = tp
@@ -855,7 +885,6 @@ def mt5_ack():
             log.info(f"Order ack: {order_id} — {status} {detail}")
 
             if status == "filled":
-                # v4.2.2: Truyền order_id vào sync_sheet
                 sync_sheet(sig, detail, order_id)
                 send_public_signal(sig, detail)
         else:
@@ -879,7 +908,7 @@ def status():
     with lock:
         cleanup()
         return jsonify({
-            "version":        "4.2.2",
+            "version":        "4.2.3",
             "uptime_s":       int(time.time() - startup_time),
             "requests":       request_count,
             "diag_mode":      DIAG_MODE,
