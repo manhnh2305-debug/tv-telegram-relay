@@ -1,7 +1,14 @@
 """
-TV → Telegram → MT5 Relay Server v4.2.3
+TV → Telegram → MT5 Relay Server v4.3.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Changes từ v4.2.2:
+Changes từ v4.2.3:
+  ✅ v4.3.0: Channel Router — route signal đến 3 kênh riêng biệt theo symbol
+             XAUUSD → @ddd_xau_signal
+             Forex pairs → @ddd_forex_signal
+             Crypto → @ddd_crypto_signal
+  ✅ v4.3.0: Giữ legacy post vào @goldsignalnodelete (tắt bằng LEGACY_PUBLIC=false)
+  ✅ v4.3.0: Health endpoint thêm channel routing info
+  ─── v4.2.3 features giữ nguyên ───
   ✅ v4.2.3: FIX round SL/TP theo digits per symbol (không hardcode 2)
   ✅ v4.2.3: FIX send_public_signal format tp1/tp2 per symbol
   ✅ v4.2.3: FIX sync_sheet RR format "1:X.XX" (cheat sheet logic #4)
@@ -38,6 +45,24 @@ STATE_FILE      = "/tmp/relay_state.json"
 ICT             = timezone(timedelta(hours=7))
 
 DIAG_MODE       = os.environ.get("DIAG_MODE", "true").lower() == "true"
+
+# ─── v4.3.0: Channel Router Config ────────────────────────────────────────────
+XAU_CHANNEL_ID    = os.environ.get("XAU_CHANNEL_ID", "")
+FOREX_CHANNEL_ID  = os.environ.get("FOREX_CHANNEL_ID", "")
+CRYPTO_CHANNEL_ID = os.environ.get("CRYPTO_CHANNEL_ID", "")
+
+# Giữ legacy post vào @goldsignalnodelete song song (giai đoạn chuyển tiếp)
+# Set LEGACY_PUBLIC=false trên Render khi 3 kênh mới ổn định
+LEGACY_PUBLIC = os.environ.get("LEGACY_PUBLIC", "true").lower() == "true"
+
+# Symbol sets cho routing
+_XAU_SYMBOLS = {"XAUUSD"}
+_CRYPTO_SYMBOLS = {
+    "BTCUSD", "BTCUSDT", "ETHUSD", "ETHUSDT",
+    "SOLUSD", "SOLUSDT", "BNBUSD", "BNBUSDT",
+    "XRPUSD", "XRPUSDT", "ADAUSD", "ADAUSDT",
+    "DOGEUSDT", "AVAXUSDT", "DOTUSDT",
+}
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -123,19 +148,17 @@ def signal_hash(data):
 
 
 # ── v4.2.3: Price digits per symbol ──────────────────────────────────────────
-# Thay thế round(..., 2) hardcode → round đúng theo symbol
-# Match cheat sheet logic #5 multiplier + broker digits
 def get_digits(symbol):
     """Return số decimal places cho SL/TP/price per symbol."""
     s = symbol.upper().replace(SYMBOL_SUFFIX, "")
-    if "XAU" in s:                                      return 2   # 3300.50
-    if "XAG" in s:                                      return 3   # 30.500
-    if "BTC" in s:                                      return 1   # 69670.0
-    if "ETH" in s:                                      return 2   # 3500.00
-    if "OIL" in s or "WTI" in s or "BRENT" in s:       return 3   # 61.500
-    if "NAS" in s or "US30" in s or "US500" in s:       return 2   # 18500.00
-    if "JPY" in s:                                      return 3   # 142.500
-    return 5  # Forex: EURUSD=1.16962, GBPUSD, USDCAD, USDCHF
+    if "XAU" in s:                                      return 2
+    if "XAG" in s:                                      return 3
+    if "BTC" in s:                                      return 1
+    if "ETH" in s:                                      return 2
+    if "OIL" in s or "WTI" in s or "BRENT" in s:       return 3
+    if "NAS" in s or "US30" in s or "US500" in s:       return 2
+    if "JPY" in s:                                      return 3
+    return 5
 
 
 def request_timer(f):
@@ -191,11 +214,193 @@ def send_diag(text):
         send_text(f"<b>DIAG</b>\n{text}")
 
 
-# ─── v4.2: Public Channel Post ────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# v4.3.0: CHANNEL ROUTER
+# ═════════════════════════════════════════════════════════════════════════════
 
-def send_public_signal(sig, fill_detail=""):
+def classify_symbol(symbol):
+    """
+    Phân loại symbol → 'xau' | 'forex' | 'crypto'
+    """
+    sym = symbol.upper().replace(SYMBOL_SUFFIX, "").strip()
+    if sym in _XAU_SYMBOLS:
+        return "xau"
+    if sym in _CRYPTO_SYMBOLS:
+        return "crypto"
+    return "forex"
+
+
+def get_channel_id(channel_type):
+    """
+    Trả về channel ID cho từng loại.
+    """
+    return {
+        "xau":    XAU_CHANNEL_ID,
+        "forex":  FOREX_CHANNEL_ID,
+        "crypto": CRYPTO_CHANNEL_ID,
+    }.get(channel_type, "")
+
+
+def format_channel_message(sig, channel_type):
+    """
+    Format tin nhắn cho kênh public theo từng loại.
+    Giữ style gần giống send_public_signal() cũ, thêm header emoji theo kênh.
+    """
+    action   = sig.get("action", "")
+    symbol   = sig.get("symbol", "XAUUSD").replace(SYMBOL_SUFFIX, "")
+    price    = sig.get("price", "—")
+    sl       = sig.get("sl", "—")
+    tp       = sig.get("tp", "—")
+    tf       = sig.get("tf", "M5")
+    sig_type = sig.get("signal_type", "vsa")
+    trend    = sig.get("trend", "")
+    mode     = sig.get("mode", "")
+
+    digits = get_digits(symbol)
+
+    # Tính TP1 (RR 1:1) và TP2 (RR 1:2) từ entry + SL
+    tp1 = "—"
+    tp2 = "—"
+    try:
+        p = float(price)
+        s = float(sl)
+        risk_dist = abs(p - s)
+        if risk_dist > 0:
+            if action == "BUY":
+                tp1 = f"{p + risk_dist:.{digits}f}"
+                tp2 = f"{p + risk_dist * 2:.{digits}f}"
+            else:
+                tp1 = f"{p - risk_dist:.{digits}f}"
+                tp2 = f"{p - risk_dist * 2:.{digits}f}"
+    except (ValueError, TypeError, ZeroDivisionError):
+        tp1 = str(tp)
+        tp2 = "—"
+
+    # Reason
+    if sig_type == "div":
+        reason = "HARSI divergence + VSA confirmation"
+    else:
+        reason = "VSA engulfing + volume shift"
+    if trend:
+        reason += f" | Trend: {trend}"
+    if mode:
+        reason += f" ({mode})"
+
+    # Direction emoji
+    if action == "BUY":
+        arrow     = "🚀"
+        emoji     = "🟢"
+        direction = "BUY"
+    else:
+        arrow     = "📉"
+        emoji     = "🔴"
+        direction = "SELL"
+
+    # Timeframe tag
+    if tf in ("M5", "M15", "M30"):
+        tf_tag = "⚡ SCALP"
+    elif tf in ("H1", "H4"):
+        tf_tag = "📊 SWING"
+    else:
+        tf_tag = "📈 POSITION"
+
+    # Header emoji theo kênh
+    channel_icon = {
+        "xau":    "🥇",
+        "forex":  "💱",
+        "crypto": "🪙",
+    }.get(channel_type, "📊")
+
+    text = (
+        f"{channel_icon} {arrow} <b>{emoji} {direction} {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{tf_tag} | {tf}\n"
+        f"\n"
+        f"📍 Entry: <b>{price}</b>\n"
+        f"🛡 SL: <b>{sl}</b>\n"
+        f"🎯 TP1: <b>{tp1}</b>  — RR 1:1\n"
+        f"🏆 TP2: <b>{tp2}</b>  — RR 1:2\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>{reason}</i>\n"
+        f"🕐 {now_ict()}\n\n"
+        f"#signal #{symbol} #{direction.lower()}\n"
+        f"🔔 <b>Đừng Đu Đỉnh</b>"
+    )
+    return text
+
+
+def send_to_channel(channel_id, text):
+    """
+    Gửi tin nhắn đến 1 Telegram channel cụ thể.
+    Returns True nếu thành công.
+    """
+    if not channel_id:
+        return False
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id":    channel_id,
+        "text":       text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.ok and r.json().get("ok"):
+            return True
+        else:
+            log.error(f"Channel post failed [{channel_id}]: {r.status_code} {r.text[:200]}")
+            return False
+    except Exception as e:
+        log.error(f"Channel post exception [{channel_id}]: {e}")
+        return False
+
+
+def route_to_channels(sig, fill_detail=""):
+    """
+    v4.3.0: Main routing function.
+    Phân loại symbol → format → gửi đúng kênh.
+    Đồng thời giữ legacy post nếu LEGACY_PUBLIC=true.
+    """
+    symbol = sig.get("symbol", "XAUUSD").replace(SYMBOL_SUFFIX, "")
+
+    # ── Step 1: Route đến kênh mới ──
+    channel_type = classify_symbol(symbol)
+    channel_id   = get_channel_id(channel_type)
+
+    routed_ok = False
+    if channel_id:
+        message   = format_channel_message(sig, channel_type)
+        routed_ok = send_to_channel(channel_id, message)
+
+        if routed_ok:
+            log.info(f"📡 Routed: {sig.get('action')} {symbol} → {channel_type} ({channel_id})")
+            send_text(f"📡 Signal <b>{sig.get('action')} {symbol}</b> → kênh <b>{channel_type.upper()}</b> ✅")
+        else:
+            log.error(f"📡 Route FAILED: {symbol} → {channel_type} ({channel_id})")
+            send_text(f"⚠️ Route <b>FAILED</b>: {sig.get('action')} {symbol} → {channel_type}")
+    else:
+        log.warning(f"📡 No channel configured for {channel_type} — skipping route")
+
+    # ── Step 2: Legacy post (giai đoạn chuyển tiếp) ──
+    if LEGACY_PUBLIC and PUBLIC_CHAT_ID:
+        send_public_signal_legacy(sig, fill_detail)
+
+    return {
+        "channel_type": channel_type,
+        "channel_id":   channel_id,
+        "success":      routed_ok,
+    }
+
+
+# ─── Legacy Public Post (giữ nguyên từ v4.2.3, đổi tên) ──────────────────────
+
+def send_public_signal_legacy(sig, fill_detail=""):
+    """
+    Post vào @goldsignalnodelete (kênh cũ).
+    Giữ nguyên logic v4.2.3. Sẽ tắt khi LEGACY_PUBLIC=false.
+    """
     if not PUBLIC_CHAT_ID:
-        log.warning("PUBLIC_CHAT_ID not set — skipping public post")
         return
 
     action  = sig.get("action", "")
@@ -208,7 +413,6 @@ def send_public_signal(sig, fill_detail=""):
     trend    = sig.get("trend", "")
     mode     = sig.get("mode", "")
 
-    # v4.2.3: Format theo digits của symbol
     digits = get_digits(symbol)
 
     tp1 = "—"
@@ -268,14 +472,11 @@ def send_public_signal(sig, fill_detail=""):
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.ok:
-            log.info(f"Public signal posted: {direction} {symbol} @ {price}")
-            send_text(f"📢 Da post signal <b>{direction} {symbol}</b> sang kenh public")
+            log.info(f"Legacy public signal posted: {direction} {symbol} @ {price}")
         else:
-            log.error(f"Public post failed: {r.status_code} {r.text[:200]}")
-            send_text(f"<b>Public post FAILED</b>: {r.status_code}\n<code>{r.text[:200]}</code>")
+            log.error(f"Legacy public post failed: {r.status_code} {r.text[:200]}")
     except Exception as e:
-        log.error(f"Public post exception: {e}")
-        send_text(f"<b>Public post ERROR</b>: {e}")
+        log.error(f"Legacy public post exception: {e}")
 
 
 # ─── v4.2.2: FIXED sync_sheet ─────────────────────────────────────────────────
@@ -300,7 +501,6 @@ def sync_sheet(sig, lot_str="", order_id=""):
         risk_usd = sig.get("risk_usd", 0)
         sig_type = sig.get("signal_type", "vsa")
 
-        # Parse lot từ ack detail string: "0.01 lot @ spread $5.70"
         lot = 0.01
         spread = 0
         if lot_str:
@@ -310,7 +510,6 @@ def sync_sheet(sig, lot_str="", order_id=""):
                     lot = float(parts[0])
                 except ValueError:
                     pass
-            # Extract spread from "... spread $5.70"
             if "spread" in lot_str:
                 try:
                     spread_idx = lot_str.index("$") + 1
@@ -318,7 +517,6 @@ def sync_sheet(sig, lot_str="", order_id=""):
                 except (ValueError, IndexError):
                     pass
 
-        # v4.2.3 FIX: Tính RR → format "1:X.XX" (cheat sheet logic #4)
         rr = ""
         try:
             e = float(entry)
@@ -327,7 +525,7 @@ def sync_sheet(sig, lot_str="", order_id=""):
             risk = abs(e - s)
             reward = abs(t - e)
             if risk > 0:
-                rr = f"1:{reward / risk:.2f}"   # ← FIX: "1:2.33" thay vì 2.33
+                rr = f"1:{reward / risk:.2f}"
         except (ValueError, TypeError, ZeroDivisionError):
             pass
 
@@ -470,12 +668,27 @@ def send_signal_message(data, callback_id):
 # ─── Startup notification ──────────────────────────────────────────────────────
 
 def notify_startup():
+    # v4.3.0: Hiện thêm channel routing info
+    channels_info = []
+    if XAU_CHANNEL_ID:
+        channels_info.append(f"🥇 XAU → {XAU_CHANNEL_ID}")
+    if FOREX_CHANNEL_ID:
+        channels_info.append(f"💱 Forex → {FOREX_CHANNEL_ID}")
+    if CRYPTO_CHANNEL_ID:
+        channels_info.append(f"🪙 Crypto → {CRYPTO_CHANNEL_ID}")
+
+    channels_str = "\n".join(channels_info) if channels_info else "⚠️ Chưa cấu hình kênh mới"
+    legacy_str = f"📢 Legacy: {PUBLIC_CHAT_ID}" if LEGACY_PUBLIC else "📢 Legacy: OFF"
+
     send_text(
-        f"🚀 <b>Relay Server v4.2.3 started</b>\n"
+        f"🚀 <b>Relay Server v4.3.0 started</b>\n"
         f"⏰ {now_ict_full()}\n"
         f"📊 State: {len(mt5_queue)} orders, {len(pending)} pending, {len(zone_state)} zones\n"
-        f"🔍 Diag mode: {'ON' if DIAG_MODE else 'OFF'}\n"
-        f"📢 Public channel: {PUBLIC_CHAT_ID or 'NOT SET'}"
+        f"🔍 Diag: {'ON' if DIAG_MODE else 'OFF'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 <b>Channel Routing:</b>\n"
+        f"{channels_str}\n"
+        f"{legacy_str}"
     )
 
 notify_startup()
@@ -491,14 +704,19 @@ def health():
         cleanup()
     return jsonify({
         "status":         "ok",
-        "version":        "4.2.3",
+        "version":        "4.3.0",
         "uptime_s":       int(time.time() - startup_time),
         "pending":        len(pending),
         "mt5_queue":      len(mt5_queue),
         "active_zones":   len(zone_state),
         "requests":       request_count,
         "diag_mode":      DIAG_MODE,
-        "public_channel": PUBLIC_CHAT_ID,
+        "channel_routing": {
+            "xau":    XAU_CHANNEL_ID or "(not set)",
+            "forex":  FOREX_CHANNEL_ID or "(not set)",
+            "crypto": CRYPTO_CHANNEL_ID or "(not set)",
+            "legacy": PUBLIC_CHAT_ID if LEGACY_PUBLIC else "(disabled)",
+        },
     }), 200
 
 
@@ -605,7 +823,6 @@ def signal_route():
     sig_type  = data.get("signal_type", "vsa")
     zone_type = data.get("zone_type", "").upper()
 
-    # v4.2.3: Lấy digits cho symbol này
     digits = get_digits(symbol)
 
     with lock:
@@ -667,7 +884,6 @@ def signal_route():
 
         div_sl = data.get("div_sl")
 
-        # v4.2.3 FIX: round theo digits thay vì hardcode 2
         if div_sl and sig_type == "div":
             try:
                 sl = round(float(div_sl), digits)
@@ -688,7 +904,7 @@ def signal_route():
             sl, tp = calc_sl_tp(action, price,
                                 zs.get("top", 0) if zs else 0,
                                 zs.get("bottom", 0) if zs else 0,
-                                symbol)   # ← v4.2.3: truyền symbol
+                                symbol)
 
         data["sl"] = sl
         data["tp"] = tp
@@ -884,9 +1100,22 @@ def mt5_ack():
             )
             log.info(f"Order ack: {order_id} — {status} {detail}")
 
+            # v4.3.0: Khi filled → ghi sheet + route đến đúng kênh
             if status == "filled":
                 sync_sheet(sig, detail, order_id)
-                send_public_signal(sig, detail)
+
+                # Route signal đến kênh mới (+ legacy nếu bật)
+                try:
+                    route_result = route_to_channels(sig, detail)
+                    log.info(f"📡 Route result: {route_result}")
+                except Exception as e:
+                    log.error(f"📡 Channel routing error: {e}")
+                    # Fallback: nếu routing mới lỗi hoàn toàn, post legacy
+                    if not LEGACY_PUBLIC:
+                        try:
+                            send_public_signal_legacy(sig, detail)
+                        except Exception:
+                            pass
         else:
             log.warning(f"Ack for unknown order: {order_id}")
 
@@ -908,11 +1137,16 @@ def status():
     with lock:
         cleanup()
         return jsonify({
-            "version":        "4.2.3",
+            "version":        "4.3.0",
             "uptime_s":       int(time.time() - startup_time),
             "requests":       request_count,
             "diag_mode":      DIAG_MODE,
-            "public_channel": PUBLIC_CHAT_ID,
+            "channel_routing": {
+                "xau":    XAU_CHANNEL_ID or "(not set)",
+                "forex":  FOREX_CHANNEL_ID or "(not set)",
+                "crypto": CRYPTO_CHANNEL_ID or "(not set)",
+                "legacy": PUBLIC_CHAT_ID if LEGACY_PUBLIC else "(disabled)",
+            },
             "zones":          {k: {**v, "expires_in": max(0, int(v["expires"] - time.time()))} for k, v in zone_state.items()},
             "pending":        {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in pending.items()},
             "mt5_queue":      mt5_queue,
