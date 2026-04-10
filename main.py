@@ -1129,48 +1129,6 @@ def debug_last():
     return jsonify(last_signal_log), 200
 
 
-@app.route("/test/route", methods=["POST"])
-def test_route():
-    """
-    v4.3.0: Test endpoint — gửi signal giả đến kênh để kiểm tra routing.
-    Không ảnh hưởng flow trade thật (không tạo order, không ghi sheet).
-    Xoá endpoint này sau khi test xong nếu muốn.
-    """
-    if not verify_api_key():
-        return jsonify({"error": "unauthorized"}), 401
-
-    data = request.get_json(force=True, silent=True) or {}
-
-    # Defaults cho test
-    test_sig = {
-        "symbol":      data.get("symbol", "XAUUSD"),
-        "action":      data.get("action", "BUY"),
-        "price":       data.get("price", "3245.50"),
-        "sl":          data.get("sl", "3238.00"),
-        "tp":          data.get("tp", "3260.00"),
-        "tf":          data.get("tf", "M5"),
-        "signal_type": data.get("signal_type", "div"),
-        "trend":       data.get("trend", "UP"),
-        "mode":        data.get("mode", ""),
-    }
-
-    symbol = test_sig["symbol"]
-    channel_type = classify_symbol(symbol)
-    channel_id = get_channel_id(channel_type)
-
-    log.info(f"🧪 TEST route: {test_sig['action']} {symbol} → {channel_type} ({channel_id})")
-
-    result = route_to_channels(test_sig, "TEST")
-
-    return jsonify({
-        "test":         True,
-        "symbol":       symbol,
-        "classified":   channel_type,
-        "channel_id":   channel_id,
-        "route_result": result,
-    }), 200
-
-
 @app.route("/status", methods=["GET"])
 def status():
     if not verify_api_key():
