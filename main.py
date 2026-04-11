@@ -247,9 +247,9 @@ def format_channel_message(sig, channel_type):
     if mode:  reason += f" ({mode})"
 
     arrow, emoji, direction = ("🚀", "🟢", "BUY") if action == "BUY" else ("📉", "🔴", "SELL")
-    if tf in ("M5", "M15", "M30"):   tf_tag = "⚡ SCALP"
-    elif tf in ("H1", "H4"):         tf_tag = "📊 SWING"
-    else:                             tf_tag = "📈 POSITION"
+  if tf in ("M5", "M15", "M30"):          tf_tag = "⚡ SCALP"
+  elif tf in ("H1", "H4", "SWING"):       tf_tag = "📊 SWING"
+  else:                                    tf_tag = "📈 POSITION"
     channel_icon = {"xau": "🥇", "forex": "💱", "crypto": "🪙"}.get(channel_type, "📊")
 
     return (
