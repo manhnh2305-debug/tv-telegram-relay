@@ -410,6 +410,39 @@ def sync_sheet(sig, lot_str="", order_id=""):
         log.error(f"Sheet error: {e}")
 
 
+# ─── v4.4: Log signal to sheet SignalLog ───────────────────────────────────────
+
+def log_signal_to_sheet(sig):
+    if not SHEET_URL: return
+    try:
+        symbol = sig.get("symbol", "").replace(SYMBOL_SUFFIX, "")
+        action = sig.get("action", "")
+        price  = sig.get("price", 0)
+        sl     = sig.get("sl", 0)
+        tf     = sig.get("tf", "")
+        digits = get_digits(symbol)
+        tp1 = tp2 = tp3 = 0
+        try:
+            p, s = float(price), float(sl)
+            risk = abs(p - s)
+            if risk > 0:
+                if action == "BUY":
+                    tp1, tp2, tp3 = p + risk, p + risk*2, p + risk*3
+                else:
+                    tp1, tp2, tp3 = p - risk, p - risk*2, p - risk*3
+                tp1, tp2, tp3 = round(tp1, digits), round(tp2, digits), round(tp3, digits)
+        except Exception: pass
+        requests.post(SHEET_URL, json={
+            "type": "signal", "symbol": symbol, "action": action,
+            "price": price, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "tf": tf, "signal_type": sig.get("signal_type", ""),
+            "source": "relay", "trend": sig.get("trend", ""), "mode": sig.get("mode", ""),
+        }, timeout=5)
+        log.info(f"📊 Signal logged to sheet: {action} {symbol}")
+    except Exception as e:
+        log.warning(f"Signal log failed: {e}")
+
+
 # ─── Misc helpers (giữ nguyên) ─────────────────────────────────────────────────
 
 def calc_pnl_usd(symbol, lots, entry, exit_price):
@@ -697,6 +730,7 @@ def signal_route():
         try:
             result = route_to_channels(crypto_copy)
             log.info(f"📡 Crypto route: {result}")
+            log_signal_to_sheet(crypto_copy)
         except Exception as e:
             log.error(f"📡 Crypto route error: {e}")
             send_text(f"⚠️ Crypto route error: {e}")
@@ -854,6 +888,7 @@ def mt5_ack():
                 else:
                     try:
                         route_to_channels(sig, detail)
+                        log_signal_to_sheet(sig)
                     except Exception as e:
                         log.error(f"📡 Route error: {e}")
                         if not LEGACY_PUBLIC:
