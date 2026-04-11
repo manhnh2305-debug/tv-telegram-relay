@@ -199,6 +199,20 @@ def classify_symbol(symbol):
     if sym in _CRYPTO_SYMBOLS: return "crypto"
     return "forex"
 
+
+def to_mt5_symbol(symbol):
+    """
+    Convert TradingView symbol → Exness MT5 symbol.
+    Crypto: BTCUSDT → BTCUSD (Exness dùng USD, không USDT)
+    Forex: giữ nguyên + SYMBOL_SUFFIX nếu có
+    """
+    sym = symbol.upper().replace(SYMBOL_SUFFIX, "").strip()
+    if classify_symbol(sym) == "crypto" and sym.endswith("USDT"):
+        sym = sym[:-1]  # BTCUSDT → BTCUSD
+    if SYMBOL_SUFFIX:
+        return sym + SYMBOL_SUFFIX
+    return sym
+
 def get_channel_id(channel_type):
     return {"xau": XAU_CHANNEL_ID, "forex": FOREX_CHANNEL_ID, "crypto": CRYPTO_CHANNEL_ID}.get(channel_type, "")
 
@@ -736,7 +750,7 @@ def webhook_tg():
                 emoji    = "🔴" if action == "SELL" else "🟢"
 
                 order_id   = str(uuid.uuid4())[:8]
-                mt5_symbol = symbol + SYMBOL_SUFFIX if SYMBOL_SUFFIX else symbol
+                mt5_symbol = to_mt5_symbol(symbol)
 
                 mt5_queue[order_id] = {
                     "order_id": order_id, "action": action, "symbol": mt5_symbol,
